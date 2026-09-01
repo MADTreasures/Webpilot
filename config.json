@@ -1,0 +1,11 @@
+{
+  "$comment": "Domain-Allowlist fuer webpilot. Nur Hauptframe-Navigationen werden geprueft; Subframes (OAuth, Captcha) bleiben frei.",
+  "allowedDomains": [
+    "localhost",
+    "127.0.0.1"
+  ],
+  "profilesDir": "profiles",
+  "flowsDir": "flows",
+  "screenshotsDir": "screenshots",
+  "logBufferSize": 500
+}

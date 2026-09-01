@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>Webpilot Testlogin</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 26rem; }
+    label { display: block; margin: .75rem 0 .25rem; }
+    input { width: 100%; padding: .5rem; box-sizing: border-box; }
+    button { margin-top: 1rem; padding: .5rem 1rem; }
+    .err { color: #b00; }
+  </style>
+</head>
+<body>
+  <h1>Testlogin</h1>
+  <p id="hint">Bitte anmelden.</p>
+  <form id="login-form" method="post" action="/login">
+    <label for="user">Benutzername</label>
+    <input id="user" name="user" type="text" autocomplete="username" data-testid="username-input">
+    <label for="password">Passwort</label>
+    <input id="password" name="password" type="password" autocomplete="current-password">
+    <label><input type="checkbox" id="remember" name="remember"> Angemeldet bleiben</label>
+    <button type="submit" data-testid="login-submit">Anmelden</button>
+  </form>
+  <p><a href="/about">Über diese Seite</a></p>
+</body>
+</html>

@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="de">
+<head><meta charset="utf-8"><title>Login im iframe</title>
+<style>body{font-family:system-ui,sans-serif;margin:2rem} iframe{width:30rem;height:26rem;border:1px solid #ccc}</style></head>
+<body>
+  <h1>Eingebetteter Login</h1>
+  <!-- src traegt eine wechselnde Nonce: genau der Fall, der die Frame-Aufloesung schwer macht -->
+  <iframe id="login-frame" name="loginframe" title="Login" src="__SRC__"></iframe>
+</body>
+</html>

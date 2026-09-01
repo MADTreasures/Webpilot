@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Browser-Profile enthalten Session-Cookies und Login-State
+profiles/
+# Fehler-Screenshots koennen sensible Seiteninhalte zeigen
+screenshots/
+logs/
+
+.DS_Store
+*.log
