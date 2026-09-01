@@ -13,3 +13,4 @@ logs/
 .tmp-test/profiles/
 .tmp-test/flows/
 .tmp-test/screenshots/
+.reviewtmp/
