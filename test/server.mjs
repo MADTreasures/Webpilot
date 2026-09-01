@@ -10,6 +10,8 @@
 //   GET  /embed?src=...    Seite mit einem iframe auf eine frei waehlbare URL
 //   GET  /redirect?to=...  302 auf eine frei waehlbare URL
 //   GET  /shadow           dasselbe Login-Formular in einer offenen Shadow-Root
+//   GET  /tricky           Sammelseite fuer Sonderfaelle (aria-hidden, :text-is,
+//                          Enter auf einem Link, Autofill, verzoegerte Navigation)
 //
 // Zugangsdaten: demo / s3cr3t
 import { createServer } from 'node:http';
@@ -72,6 +74,7 @@ export function createTestServer() {
       }
       if (path.startsWith('/frame/')) return send(res, 200, await page('login.html'));
       if (path === '/shadow') return send(res, 200, await page('shadow.html'));
+      if (path === '/tricky') return send(res, 200, await page('tricky.html'));
       if (path === '/redirect') {
         // 302 auf eine frei waehlbare URL - prueft die Allowlist gegen Redirects.
         const to = url.searchParams.get('to') ?? '/';

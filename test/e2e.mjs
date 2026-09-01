@@ -176,7 +176,7 @@ try {
     const press = lines.find((e) => e.kind === 'press');
     check('Enter-Keydown aufgezeichnet', press?.key === 'Enter');
     check('der vom Browser erzeugte Default-Button-Klick ist als Folge markiert',
-      lines.some((e) => e.kind === 'click' && e.causeKind === 'implicit-submit' && e.causedBy === press?.id));
+      lines.some((e) => e.kind === 'click' && e.causeKind === 'implicit-activation' && e.causedBy === press?.id));
     check('kein doppeltes fill fuer dasselbe Feld',
       lines.filter((e) => e.kind === 'fill' && e.target?.isPassword).length === 1);
   }
@@ -219,6 +219,85 @@ try {
     const who = await s.page().locator('[data-testid="who"]').textContent().catch(() => null);
     await s.close();
     check('Shadow-DOM-Login laesst sich wiederholen', who === 'demo', String(who));
+  }
+
+  section('Sonderfaelle: aria-hidden, :text-is, Enter auf einem Link, Autofill');
+  {
+    const s = await open('tricky');
+    await s.recorder.start('tricky');
+    await s.goto(`${origin}/tricky`);
+    const p = s.page();
+
+    await p.locator('#ariah-1').click();
+    await p.locator('.karte').first().click();
+
+    // Zwei Felder per Skript fuellen, wie es ein Passwortmanager tut:
+    // synthetische input-Events, kein change, kein Klick dazwischen.
+    await p.evaluate(() => {
+      const u = document.getElementById('auto-user');
+      const pw = document.getElementById('auto-pass');
+      u.value = 'autodemo';
+      u.dispatchEvent(new Event('input', { bubbles: true }));
+      pw.value = 'autogeheim';
+      pw.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await p.getByTestId('auto-submit').click();
+    await p.waitForURL('**/denied', { timeout: 15000 });
+    await p.goBack();
+    await p.waitForTimeout(300);
+
+    // Enter auf einem fokussierten Link: EINE Nutzeraktion.
+    await p.locator('#enter-link').focus();
+    await p.keyboard.press('Enter');
+    await p.waitForURL('**/about', { timeout: 15000 });
+    await p.waitForTimeout(300);
+
+    const res = await s.recorder.stop();
+    await s.close();
+    const lines = readFileSync(res.path, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+
+    const ariaClick = lines.find((e) => e.kind === 'click' && e.target?.tag === 'button' && e.target.accessibleName.startsWith('Weiter'));
+    check('aria-hidden zaehlt nicht zum Accessible Name',
+      ariaClick?.target.accessibleName === 'Weiter', JSON.stringify(ariaClick?.target.accessibleName));
+
+    const karteClick = lines.find((e) => e.kind === 'click' && e.target?.tag === 'div');
+    const karteChain = karteClick ? [karteClick.target.selectors.primary, ...karteClick.target.selectors.fallbacks] : [];
+    check('mehrdeutiger Textselektor wird nicht Primaerselektor',
+      karteClick && karteClick.target.selectors.primary.kind !== 'text', JSON.stringify(karteChain[0]));
+
+    const autoFills = lines.filter((e) => e.kind === 'fill' && ['user', 'password'].includes(e.target?.fieldName));
+    check('Autofill: BEIDE Feldwerte werden erfasst, keiner verdraengt den anderen',
+      autoFills.length === 2 && autoFills[0].value === 'autodemo' && autoFills[1].value === '{{secret:password}}',
+      JSON.stringify(autoFills.map((e) => e.value)));
+    check('per Skript gefuelltes Passwort steht nicht im Klartext',
+      !JSON.stringify(lines).includes('autogeheim'));
+
+    const linkPress = lines.find((e) => e.kind === 'press' && e.target?.tag === 'a');
+    const linkClick = lines.find((e) => e.kind === 'click' && e.target?.tag === 'a');
+    check('Enter auf einem Link wird als press aufgezeichnet', !!linkPress, String(linkPress?.key));
+    check('der vom Browser erzeugte Aktivierungs-Klick auf den Link ist als Folge markiert',
+      !!linkClick && linkClick.causedBy === linkPress?.id && linkClick.causeKind === 'implicit-activation',
+      JSON.stringify({ c: linkClick?.causedBy, k: linkClick?.causeKind }));
+  }
+
+  section('Verzoegerte Navigation');
+  {
+    const s = await open('slowrec');
+    await s.recorder.start('slow');
+    await s.goto(`${origin}/tricky`);
+    await s.page().getByTestId('slow-go').click();
+    await s.page().waitForURL('**/welcome*', { timeout: 15000 });
+    await s.page().waitForTimeout(300);
+    await s.recorder.stop();
+    await s.close();
+
+    const s2 = await open('slowplay');
+    await replayFlow(s2, config, 'slow', { env: {} });
+    const url = s2.page().url();
+    const who = await s2.page().locator('[data-testid="who"]').textContent().catch(() => null);
+    await s2.close();
+    check('Replay wartet auf eine erst verzoegert ausgeloeste Navigation',
+      url.includes('/welcome') && who === 'langsam', `${url} / ${who}`);
   }
 
   /* ================= Replay ================= */

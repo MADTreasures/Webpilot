@@ -32,6 +32,8 @@ export interface ReplayOptions {
   timeout?: number;
   /** Zeitbudget je Fallback-Selektor. */
   fallbackTimeout?: number;
+  /** Wartezeit auf eine Navigation, die im Mitschnitt auf eine Aktion folgte. */
+  navigationTimeout?: number;
   env?: NodeJS.ProcessEnv;
   screenshotsDir?: string;
 }
@@ -144,6 +146,14 @@ export function resolveSecrets(value: string, env: NodeJS.ProcessEnv): string {
     missing.push(rawName);
     return '';
   });
+  if (result.includes('{{secret:')) {
+    // Uebrig gebliebener Platzhalter: lieber abbrechen als ihn woertlich in ein
+    // Formular tippen.
+    throw new Error(
+      `Der Wert enthaelt einen nicht aufgeloesten Platzhalter (${result}). ` +
+        `Das deutet auf einen kaputt aufgezeichneten Feldnamen hin - der Flow muss neu aufgenommen werden.`,
+    );
+  }
   if (missing.length > 0) {
     const details = missing
       .map((field) => `{{secret:${field}}} erwartet ${secretEnvNames(field).join(' oder ')}`)
@@ -278,6 +288,7 @@ export async function replayFlow(
   const events = readFlow(config, name);
   const timeout = options.timeout ?? 10_000;
   const fallbackTimeout = options.fallbackTimeout ?? 3_000;
+  const navigationTimeout = options.navigationTimeout ?? 5_000;
   const env = options.env ?? process.env;
   const screenshotsDir = options.screenshotsDir ?? config.screenshotsDirAbs;
 
@@ -327,6 +338,7 @@ export async function replayFlow(
       }
 
       const page = target.page();
+      const urlBeforeAction = page.url();
       const scope = await resolveScope(page, event.frame, timeout, fallbackTimeout);
 
       if (event.kind === 'submit') {
@@ -361,14 +373,18 @@ export async function replayFlow(
         }
       }
 
-      // Wenn im Mitschnitt direkt danach eine Navigation kam, hier auf das
-      // Laden warten. Sonst laeuft der naechste Selektor gegen die alte Seite.
+      // Kam im Mitschnitt direkt danach eine Navigation, hier darauf warten.
+      // waitForLoadState allein genuegt nicht: loest die Seite die Navigation
+      // verzoegert aus (setTimeout im Klick-Handler), ist der Ladezustand noch
+      // der ALTE und die Funktion kehrt sofort zurueck - der naechste Selektor
+      // liefe dann gegen die alte Seite. Also erst auf einen URL-Wechsel warten.
       const next = events[i + 1];
       if (next && next.kind === 'navigate') {
-        await target
-          .page()
-          .waitForLoadState('domcontentloaded', { timeout })
+        const current = target.page();
+        await current
+          .waitForURL((url) => url.toString() !== urlBeforeAction, { timeout: navigationTimeout })
           .catch(() => undefined);
+        await current.waitForLoadState('domcontentloaded', { timeout }).catch(() => undefined);
       }
     } catch (err) {
       const attempts = (err as { attempts?: string[] }).attempts ?? [];

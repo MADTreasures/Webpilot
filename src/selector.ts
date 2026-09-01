@@ -125,7 +125,6 @@ export function wpRole(el: unknown): string | null {
   const tag = e.localName;
   if (tag === 'a' || tag === 'area') return e.hasAttribute('href') ? 'link' : null;
   if (tag === 'button') return 'button';
-  if (tag === 'summary') return 'button';
   if (tag === 'textarea') return 'textbox';
   if (tag === 'select') return e.hasAttribute('multiple') || (e.size ?? 0) > 1 ? 'listbox' : 'combobox';
   if (tag === 'option') return 'option';
@@ -155,6 +154,82 @@ export function wpRole(el: unknown): string | null {
     return 'textbox';
   }
   return null;
+}
+
+/**
+ * Rollen, deren Name aus dem Inhalt gebildet werden darf. Fuer alles andere
+ * (list, listitem, table, dialog, generic ...) vergibt Playwright KEINEN Namen
+ * aus dem Textinhalt - ein daraus gebauter getByRole-Selektor findet dann
+ * nichts. Nachgemessen: getByRole('listitem', {name:'Alpha'}) => 0 Treffer.
+ */
+export function wpNameFromContentAllowed(role: string | null): boolean {
+  if (!role) return false;
+  const allowed = [
+    'button', 'cell', 'checkbox', 'columnheader', 'gridcell', 'heading', 'link',
+    'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'radio', 'row',
+    'rowheader', 'switch', 'tab', 'tooltip', 'treeitem',
+  ];
+  return allowed.indexOf(role) !== -1;
+}
+
+/** Zaehlt ein Teilbaum-Element zum Accessible Name? aria-hidden und Unsichtbares nicht. */
+export function wpHiddenForName(el: unknown): boolean {
+  const e = el as {
+    getAttribute?: (n: string) => string | null;
+    hasAttribute?: (n: string) => boolean;
+    ownerDocument?: { defaultView?: { getComputedStyle?: (x: unknown) => { display: string; visibility: string } } };
+  };
+  if (!e || typeof e.getAttribute !== 'function') return false;
+  if (e.getAttribute('aria-hidden') === 'true') return true;
+  if (typeof e.hasAttribute === 'function' && e.hasAttribute('hidden')) return true;
+  const view = e.ownerDocument?.defaultView;
+  if (view && typeof view.getComputedStyle === 'function') {
+    const style = view.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return true;
+  }
+  return false;
+}
+
+/**
+ * Name aus dem Inhalt - OHNE aria-hidden- und unsichtbare Teilbaeume.
+ *
+ * Genau hier laege sonst ein stiller Fehlgriff: bei
+ *   <button>Weiter <span aria-hidden="true">jetzt</span></button>
+ *   <button><span aria-hidden="true">Schritt</span>Weiter jetzt</button>
+ * ergibt schlichtes textContent fuer beide Knoepfe verschiedene Namen, der
+ * Rollen-Selektor gilt als eindeutig - und trifft beim Replay den ZWEITEN
+ * Button. Playwright ignoriert aria-hidden beim Namen, also muss das hier auch
+ * passieren.
+ */
+export function wpNameFromContent(el: unknown, depth: number): string {
+  if (depth > 12) return '';
+  const e = el as { childNodes?: ArrayLike<{ nodeType: number; nodeValue: string | null }> };
+  if (!e || !e.childNodes) return '';
+  const parts: string[] = [];
+  for (let i = 0; i < e.childNodes.length; i++) {
+    const node = e.childNodes[i];
+    if (!node) continue;
+    if (node.nodeType === 3) {
+      parts.push(String(node.nodeValue ?? ''));
+      continue;
+    }
+    if (node.nodeType !== 1) continue;
+    if (wpHiddenForName(node)) continue;
+    parts.push(wpNameFromContent(node, depth + 1));
+  }
+  return wpNorm(parts.join(''), 200);
+}
+
+/** Unmittelbare Textknoten eines Elements - das, was :text-is vergleicht. */
+export function wpOwnText(el: unknown): string {
+  const e = el as { childNodes?: ArrayLike<{ nodeType: number; nodeValue: string | null }> };
+  if (!e || !e.childNodes) return '';
+  const parts: string[] = [];
+  for (let i = 0; i < e.childNodes.length; i++) {
+    const node = e.childNodes[i];
+    if (node && node.nodeType === 3) parts.push(String(node.nodeValue ?? ''));
+  }
+  return wpNorm(parts.join(''), 400);
 }
 
 /**
@@ -228,8 +303,10 @@ export function wpAccName(el: unknown): string {
     if (alt) return alt;
   }
 
-  const content = wpNorm(e.textContent, 200);
-  if (content) return content;
+  if (wpNameFromContentAllowed(wpRole(el))) {
+    const content = wpNameFromContent(el, 0);
+    if (content) return content;
+  }
   return wpNorm(e.getAttribute('title'), 200);
 }
 
@@ -271,7 +348,12 @@ export function wpCssSegment(el: unknown, useNthChild: boolean): string {
  * Shadow-Grenzen werden mit einem Descendant-Kombinator ueberbrueckt, weil
  * Playwrights css-Engine offene Shadow-Roots durchdringt.
  */
-export function wpCssPath(el: unknown, anchorAtAncestorId: boolean, useNthChild: boolean): string {
+export function wpCssPath(
+  el: unknown,
+  anchorAtAncestorId: boolean,
+  useNthChild: boolean,
+  looseCombinators: boolean,
+): string {
   type Step = { sel: string; sep: string };
   const chain: Step[] = [];
   let node = el as { nodeType: number; id?: string; parentElement: unknown; getRootNode?: () => { host?: unknown } } | null;
@@ -287,7 +369,9 @@ export function wpCssPath(el: unknown, anchorAtAncestorId: boolean, useNthChild:
     chain.push({ sel: wpCssSegment(node, useNthChild), sep: sep });
     const parent = node.parentElement as typeof node;
     if (parent) {
-      sep = ' > ';
+      // Die lockere Variante nimmt Descendant statt Child: sie ueberlebt
+      // zusaetzlich eingeschobene Wrapper-Elemente zwischen den Vorfahren.
+      sep = looseCombinators ? ' ' : ' > ';
       node = parent;
       continue;
     }
@@ -417,17 +501,14 @@ export function wpVerifyRole(el: unknown, role: string, name: string): number {
   return count === 1 && hit ? 1 : 0;
 }
 
-/** Hat das Element eigene Textknoten und keine Element-Kinder? */
-export function wpIsTextLeaf(el: unknown): boolean {
-  const e = el as { children?: { length: number } };
-  return !!e && !!e.children && e.children.length === 0;
-}
-
 /**
  * Verifiziert einen Textselektor.
  *
- * Gezaehlt wird genau das, was beim Replay als `<tag>:text-is("...")` gesucht
- * wird: gleicher Tagname, keine Element-Kinder, gleicher normalisierter Text.
+ * Gezaehlt wird exakt das, was beim Replay als `<tag>:text-is("...")` gesucht
+ * wird: gleicher Tagname und gleicher UNMITTELBARER Text. Nachgemessen:
+ * `div:text-is("Alpha")` trifft sowohl `<div>Alpha</div>` als auch
+ * `<div>Alpha<span>Beta</span></div>` - eine Zaehlung ueber textContent haette
+ * den zweiten uebersehen und den Selektor faelschlich als eindeutig gemeldet.
  * Ohne Sichtbarkeitsfilter, weil die Selektor-Engine auch keinen hat.
  */
 export function wpVerifyText(el: unknown, text: string, tag: string | null): number {
@@ -437,10 +518,9 @@ export function wpVerifyText(el: unknown, text: string, tag: string | null): num
   let count = 0;
   let hit = false;
   for (let i = 0; i < list.length; i++) {
-    const candidate = list[i] as { localName: string; textContent: string | null };
+    const candidate = list[i] as { localName: string };
     if (tag && candidate.localName !== tag) continue;
-    if (!wpIsTextLeaf(candidate)) continue;
-    if (wpNorm(candidate.textContent, 400) !== text) continue;
+    if (wpOwnText(candidate) !== text) continue;
     count++;
     if (candidate === el) hit = true;
     if (count > 1) return 0;
@@ -449,15 +529,26 @@ export function wpVerifyText(el: unknown, text: string, tag: string | null): num
 }
 
 /** Feldname fuer {{secret:<name>}} und fuer die Diagnose. */
+/**
+ * Feldname fuer {{secret:<name>}} und fuer die Diagnose.
+ *
+ * Geschweifte Klammern und Doppelpunkte werden entfernt: der Name landet in
+ * einem {{secret:...}}-Platzhalter, und ein `}` darin wuerde den Platzhalter
+ * zerlegen - beim Replay wuerde er dann woertlich ins Formular getippt.
+ */
 export function wpFieldName(el: unknown): string {
   const e = el as { getAttribute: (n: string) => string | null; id?: string };
+  const clean = (value: string): string => wpNorm(value.replace(/[{}:]+/g, '-'), 64);
   const name = e.getAttribute('name');
-  if (name && wpNorm(name, 64)) return wpNorm(name, 64);
-  if (wpIsStableId(e.id)) return wpNorm(e.id, 64);
+  if (name && clean(name)) return clean(name);
+  if (wpIsStableId(e.id) && clean(String(e.id))) return clean(String(e.id));
   const testid = e.getAttribute('data-testid');
-  if (testid) return wpNorm(testid, 64);
+  if (testid && clean(testid)) return clean(testid);
   const accname = wpAccName(el);
-  if (accname) return wpNorm(accname.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''), 64);
+  if (accname) {
+    const slug = accname.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    if (slug) return wpNorm(slug, 64);
+  }
   return 'feld';
 }
 
@@ -504,18 +595,12 @@ export function wpCandidates(el: unknown): Array<{ spec: unknown; verify: number
     push({ kind: 'role', role: role, name: accName, exact: true }, wpVerifyRole(el, role, accName), 'role');
   }
 
-  // 4. Sichtbarer Text - nur fuer Blattelemente. `<li><span>Alpha</span></li>`
-  // hat zwar textContent "Alpha", aber :text-is greift dort auf den span, nicht
-  // auf das li: ein Textselektor fuer das li wuerde die Aktion still eine Ebene
-  // tiefer umlenken. Fuer input/textarea ergibt Text ohnehin keinen Sinn.
-  const ownText = wpNorm(e.textContent, 120);
-  if (
-    ownText &&
-    ownText.length <= 80 &&
-    wpIsTextLeaf(el) &&
-    e.localName !== 'input' &&
-    e.localName !== 'textarea'
-  ) {
+  // 4. Sichtbarer Text - der UNMITTELBARE Text des Elements, weil genau den
+  // :text-is vergleicht. `<li><span>Alpha</span></li>` hat keinen eigenen Text
+  // und bekommt daher keinen Textselektor; sonst wuerde die Aktion beim Replay
+  // still eine Ebene tiefer landen. Fuer input/textarea ergibt Text keinen Sinn.
+  const ownText = wpOwnText(el);
+  if (ownText && ownText.length <= 80 && e.localName !== 'input' && e.localName !== 'textarea') {
     push({ kind: 'text', value: ownText, tag: e.localName }, wpVerifyText(el, ownText, e.localName), 'text');
   }
 
@@ -523,18 +608,22 @@ export function wpCandidates(el: unknown): Array<{ spec: unknown; verify: number
   const attrCss = wpAttrCss(el);
   if (attrCss) push({ kind: 'css', value: attrCss }, wpVerifyCss(el, attrCss), 'css-attr');
 
-  const anchored = wpCssPath(el, true, false);
-  if (anchored) push({ kind: 'css', value: anchored }, wpVerifyCss(el, anchored), 'css-anchored');
+  const seen: string[] = [];
+  const pushCss = (value: string, family: string) => {
+    if (!value || seen.indexOf(value) !== -1) return;
+    seen.push(value);
+    push({ kind: 'css', value: value }, wpVerifyCss(el, value), family);
+  };
+  if (attrCss) seen.push(attrCss);
 
-  const full = wpCssPath(el, false, false);
-  if (full && full !== anchored) push({ kind: 'css', value: full }, wpVerifyCss(el, full), 'css-full');
-
-  // Positionspfad. Immer ein anderer String als die beiden oberen (dort steht
-  // nie ein :nth-child) und damit der garantierte letzte Fallback.
-  const positional = wpCssPath(el, false, true);
-  if (positional && positional !== anchored && positional !== full) {
-    push({ kind: 'css', value: positional }, wpVerifyCss(el, positional), 'css-position');
-  }
+  pushCss(wpCssPath(el, true, false, false), 'css-anchored');
+  pushCss(wpCssPath(el, false, false, false), 'css-full');
+  // Lockere Variante: Descendant- statt Child-Kombinator, ueberlebt zusaetzlich
+  // eingeschobene Wrapper.
+  pushCss(wpCssPath(el, false, false, true), 'css-loose');
+  // Positionspfad: haengt an jedes Segment ein :nth-child. Sproede, aber immer
+  // erzeugbar und garantiert ein anderer String als die Varianten darueber.
+  pushCss(wpCssPath(el, false, true, false), 'css-position');
 
   return out;
 }
@@ -587,7 +676,7 @@ export function wpDescribe(el: unknown): unknown {
   const isPassword = wpIsPassword(el);
   return {
     selectors: {
-      primary: primary ? primary.spec : { kind: 'css', value: wpCssPath(el, false, false) || e.localName },
+      primary: primary ? primary.spec : { kind: 'css', value: wpCssPath(el, false, false, false) || e.localName },
       fallbacks: fallbacks,
       unique: primary ? primary.verify === 1 : false,
     },
@@ -613,6 +702,10 @@ export const SELECTOR_INPAGE_FUNCTIONS = [
   wpQuoteAttr,
   wpIsStableId,
   wpRole,
+  wpNameFromContentAllowed,
+  wpHiddenForName,
+  wpNameFromContent,
+  wpOwnText,
   wpAccName,
   wpCssSegment,
   wpCssPath,
@@ -621,7 +714,6 @@ export const SELECTOR_INPAGE_FUNCTIONS = [
   wpVerifyCss,
   wpAllElements,
   wpVerifyRole,
-  wpIsTextLeaf,
   wpVerifyText,
   wpFieldName,
   wpIsPassword,

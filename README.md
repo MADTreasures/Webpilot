@@ -177,8 +177,14 @@ Eine JSON-Zeile pro Ereignis in `flows/<name>.jsonl`. Gemeinsame Felder:
 Zielframe (leer = Hauptframe).
 
 Ein Ereignis mit `causedBy` ist die **Folge** eines frueheren Ereignisses und
-wird beim Abspielen uebersprungen — sonst wuerde das Formular zweimal
-abgeschickt. Ebenso wird nur die **erste** Navigation aktiv als `goto`
+wird beim Abspielen uebersprungen — sonst wuerde die Aktion doppelt ausgefuehrt.
+`causeKind` sagt, woher die Zuordnung stammt:
+
+| `causeKind`           | Bedeutung                                                             |
+| --------------------- | --------------------------------------------------------------------- |
+| `submitter`           | Das `submit`-Event nennt den Button, dessen Klick aufgezeichnet wurde  |
+| `implicit-activation` | Die Aktivierung, die Enter selbst ausgeloest hat (Default-Button eines Formulars, oder der fokussierte Link) |
+| `sequence`            | Davor Klick/Enter im selben Formular, keine weitere Aktion dazwischen  | Ebenso wird nur die **erste** Navigation aktiv als `goto`
 ausgefuehrt; spaetere sind Folgen einer Aktion und wuerden POST-basierte Logins
 zerlegen.
 
@@ -420,9 +426,30 @@ Textselektor auch nur fuer solche erzeugt: bei `<li><span>Alpha</span></li>`
 wuerde ein Textselektor fuer das `li` die Aktion sonst still eine Ebene tiefer
 umlenken.
 
+**Der Accessible Name wird berechnet wie bei Playwright, nicht wie textContent.**
+`aria-hidden`- und unsichtbare Teilbaeume zaehlen nicht mit, und aus dem
+Inhalt wird ein Name nur fuer die Rollen gebildet, die das duerfen (Button,
+Link, Heading, Option …), nicht fuer `list`, `listitem`, `table` oder `dialog`.
+Das ist kein Detail: bei
+
+```html
+<button>Weiter <span aria-hidden="true">jetzt</span></button>
+<button><span aria-hidden="true">Schritt</span>Weiter jetzt</button>
+```
+
+liefert schlichtes `textContent` fuer beide Knoepfe verschiedene Namen — der
+Rollen-Selektor gilt dann als eindeutig und trifft beim Replay den **zweiten**
+Button. Ein stiller Fehlgriff ist schlimmer als ein Fehlschlag.
+
 **Selektor-Kandidaten werden in der Seite verifiziert.** Jeder Kandidat wird vor
 dem Aufschreiben gezaehlt (CSS ueber `querySelectorAll`, Rolle und Text ueber
 einen Durchlauf durch die Wurzel mit derselben Rollen- und Namensberechnung).
+Bekannte Grenze: Playwrights css-Engine durchdringt offene Shadow-Roots,
+`querySelectorAll` nicht. Enthaelt die Seite Shadow-Roots ausserhalb des
+Zielelements, kann ein Selektor deshalb als eindeutig gelten und beim Replay
+zwei Elemente treffen. Der Replay verlangt genau einen Treffer und greift dann
+zum naechsten Fallback — es wird also nie das Falsche angeklickt, nur ein
+Fallback verbraucht.
 Eindeutige Kandidaten haben Vorrang, und die beiden Fallbacks stammen aus
 anderen Strategie-Familien — sonst waeren sie im Fehlerfall genauso kaputt wie
 der Primaerselektor.

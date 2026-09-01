@@ -60,11 +60,19 @@ const base = {
  * Ein Ereignis mit `causedBy` ist die FOLGE eines frueheren Ereignisses: der
  * Browser hat es selbst ausgeloest. Beim Replay wird es uebersprungen, sonst
  * wird das Formular zweimal abgeschickt.
- *   submitter       - das submit-Event nennt den Button, dessen Klick wir kennen
- *   sequence        - unmittelbar davor Klick/Enter im selben Formular, nichts dazwischen
- *   implicit-submit - der Klick auf den Default-Button, den Enter selbst erzeugt
+ *   submitter           - das submit-Event nennt den Button, dessen Klick wir kennen
+ *   sequence            - davor Klick/Enter im selben Formular, keine Aktion dazwischen
+ *   implicit-activation - die Aktivierung, die Enter selbst ausgeloest hat: der
+ *                         Klick auf den Default-Button eines Formulars oder der
+ *                         Klick auf den fokussierten Link bzw. Button
  */
-export const CauseKindSchema = z.enum(['submitter', 'sequence', 'implicit-submit']);
+export const CauseKindSchema = z.enum([
+  'submitter',
+  'sequence',
+  'implicit-activation',
+  /** Alter Name von implicit-activation - aeltere Flows bleiben lesbar. */
+  'implicit-submit',
+]);
 
 const cause = {
   causedBy: z.string().nullable().default(null),
@@ -102,8 +110,15 @@ export function wprState(): Record<string, unknown> {
       token: Math.random().toString(36).slice(2, 10),
       queue: [] as unknown[],
       timer: null as unknown,
-      pending: null as unknown,
+      /** Element -> vorgemerkter Feldwert. Map, nicht ein einzelner Platz:
+       *  ein Autofill fuellt mehrere Felder nacheinander, der zweite Wert
+       *  wuerde sonst den ersten spurlos verdraengen. */
+      pending: new Map<object, unknown>(),
       activation: null as unknown,
+      /** Zaehlt nur Aktionen (click, press, submit), keine Feldwerte. */
+      actionSeq: 0,
+      /** Bereits verarbeitete Event-Objekte - siehe ensureRoot. */
+      seenEvents: new WeakSet<object>(),
       /** Letzter bereits gemeldeter Wert je Element - verhindert doppelte fills. */
       lastValues: new WeakMap<object, string>(),
       /** Gesetzt waehrend der Task, in der Enter verarbeitet wird. */
@@ -208,25 +223,44 @@ export function wprNotePending(el: unknown): void {
     info['text'] = '';
   }
   const value = isSecret ? '{{secret:' + String(info['fieldName']) + '}}' : wprValueOf(el);
+  const pending = st['pending'] as Map<object, unknown>;
   // Schon gemeldeter Wert: nichts vormerken. Sonst erzeugt das change-Event,
   // das beim Absenden nachtraeglich feuert, eine zweite identische Zeile.
   const seen = st['lastValues'] as WeakMap<object, string>;
   if (seen.get(el as object) === value) {
-    st['pending'] = null;
+    pending.delete(el as object);
     return;
   }
-  st['pending'] = { el: el, info: info, value: value, secret: isSecret };
+  pending.set(el as object, { el: el, info: info, value: value, secret: isSecret });
 }
 
-/** Schreibt ein aufgestautes fill-Ereignis heraus. `only` begrenzt auf ein Element. */
+/**
+ * Schreibt aufgestaute fill-Ereignisse heraus, in der Reihenfolge, in der die
+ * Felder angefasst wurden. `only` begrenzt auf ein Element, null nimmt alle.
+ */
 export function wprFlushPending(only: unknown): void {
   const st = wprState();
-  const pending = st['pending'] as { el: unknown; info: Record<string, unknown>; value: string; secret: boolean } | null;
-  if (!pending) return;
-  if (only !== null && only !== undefined && pending.el !== only) return;
-  st['pending'] = null;
-  (st['lastValues'] as WeakMap<object, string>).set(pending.el as object, pending.value);
-  wprEmit({ kind: 'fill', target: pending.info, value: pending.value, secret: pending.secret });
+  const pending = st['pending'] as Map<object, { el: unknown; info: Record<string, unknown>; value: string; secret: boolean }>;
+  if (pending.size === 0) return;
+  const lastValues = st['lastValues'] as WeakMap<object, string>;
+  const emit = (entry: { el: unknown; info: Record<string, unknown>; value: string; secret: boolean }): void => {
+    lastValues.set(entry.el as object, entry.value);
+    wprEmit({ kind: 'fill', target: entry.info, value: entry.value, secret: entry.secret });
+  };
+  if (only !== null && only !== undefined) {
+    const entry = pending.get(only as object);
+    if (!entry) return;
+    pending.delete(only as object);
+    emit(entry);
+    return;
+  }
+  const entries: Array<{ el: unknown; info: Record<string, unknown>; value: string; secret: boolean }> = [];
+  pending.forEach((entry) => entries.push(entry));
+  pending.clear();
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry) emit(entry);
+  }
 }
 
 /** Ist `el` ein Submit-Button von `form`? Genau den klickt der Browser bei Enter. */
@@ -307,7 +341,19 @@ export function wprInstall(): void {
     true,
   );
 
+  // Ein change/submit aus geslottetem Light-DOM-Inhalt laeuft ueber den
+  // flachen Baum und erreicht damit BEIDE Listener - den an der Shadow-Root
+  // und den am document. Ohne diese Sperre stuende jedes solche Ereignis
+  // zweimal im JSONL.
+  const alreadyHandled = (event: Event): boolean => {
+    const seen = wprState()['seenEvents'] as WeakSet<object>;
+    if (seen.has(event as unknown as object)) return true;
+    seen.add(event as unknown as object);
+    return false;
+  };
+
   function onChange(event: Event): void {
+      if (alreadyHandled(event)) return;
       const target = realTarget(event) as { localName?: string; selectedOptions?: ArrayLike<{ value: string }> };
       if (target && target.localName === 'select') {
         const values: string[] = [];
@@ -351,18 +397,25 @@ export function wprInstall(): void {
       // Enter loest die implizite Formularabsendung aus und der Browser klickt
       // dabei selbst auf den Default-Button. Dieser Klick ist eine Folge, keine
       // Nutzeraktion - er wird markiert und beim Replay uebersprungen.
-      const enter = st['enterPending'] as { id: string; form: unknown } | null;
-      const implicit = enter !== null && enter.form === form && wprIsSubmitButton(target, form);
+      const enter = st['enterPending'] as { id: string; form: unknown; el: unknown } | null;
+      // Enter aktiviert das fokussierte Element: bei einem Link oder Button
+      // erzeugt der Browser dafuer selbst einen Klick, bei einem Formularfeld
+      // einen Klick auf den Default-Button. Beides ist eine Folge, keine
+      // eigene Nutzeraktion - und beides passiert in derselben Task wie das
+      // keydown, ein echter Nutzerklick kann dort nicht dazwischen.
+      const implicit =
+        enter !== null && (enter.el === target || (enter.form === form && wprIsSubmitButton(target, form)));
       const info = describe(target);
       const emitted = wprEmit({
         kind: 'click',
         target: info,
         causedBy: implicit && enter ? enter.id : null,
-        causeKind: implicit ? 'implicit-submit' : null,
+        causeKind: implicit ? 'implicit-activation' : null,
       });
+      st['actionSeq'] = (st['actionSeq'] as number) + 1;
       st['activation'] = {
         id: emitted['id'],
-        seq: emitted['seq'],
+        actionSeq: st['actionSeq'],
         ts: Date.now(),
         el: target,
         form: form,
@@ -383,10 +436,18 @@ export function wprInstall(): void {
       const emitted = wprEmit({ kind: 'press', target: describe(target), key: 'Enter' });
       const st = wprState();
       const form = closestForm(target);
-      st['activation'] = { id: emitted['id'], seq: emitted['seq'], ts: Date.now(), el: target, form: form, implicit: false };
+      st['actionSeq'] = (st['actionSeq'] as number) + 1;
+      st['activation'] = {
+        id: emitted['id'],
+        actionSeq: st['actionSeq'],
+        ts: Date.now(),
+        el: target,
+        form: form,
+        implicit: false,
+      };
       // Nur fuer die Dauer dieser Task: der implizite Klick des Browsers kommt
       // synchron in der Default-Action des keydown. Kein Zeitfenster noetig.
-      st['enterPending'] = { id: emitted['id'], form: form };
+      st['enterPending'] = { id: emitted['id'], form: form, el: target };
       setTimeout(() => {
         wprState()['enterPending'] = null;
       }, 0);
@@ -395,34 +456,39 @@ export function wprInstall(): void {
   );
 
   function onSubmit(event: Event): void {
+      if (alreadyHandled(event)) return;
       // submit bewusst OHNE isTrusted-Filter: requestSubmit() aus Seitenskripten
       // erzeugt untrusted submit-Events, die trotzdem zum Ablauf gehoeren.
       const form = event.target;
       const st = wprState();
       const activation = st['activation'] as
-        | { id: string; seq: number; ts: number; el: unknown; form: unknown; implicit: boolean }
+        | { id: string; actionSeq: number; ts: number; el: unknown; form: unknown; implicit: boolean }
         | null;
       const submitter = (event as unknown as { submitter?: unknown }).submitter ?? null;
       let causedBy: string | null = null;
       let causeKind: string | null = null;
-      const enter = st['enterPending'] as { id: string; form: unknown } | null;
+      const enter = st['enterPending'] as { id: string; form: unknown; el: unknown } | null;
       if (enter && enter.form === form) {
         // Enter hat abgeschickt. Der eventuelle Default-Button-Klick dazwischen
         // ist selbst nur eine Folge; Ursache ist der Enter-Druck.
         causedBy = enter.id;
-        causeKind = 'implicit-submit';
+        causeKind = 'implicit-activation';
       } else if (activation && activation.form === form) {
         if (submitter !== null && activation.el === submitter) {
           // Kausal und ohne Zeitfenster: der Browser nennt den Ausloeser selbst.
           causedBy = activation.id;
           causeKind = 'submitter';
-        } else if (activation.seq === st['seq'] && Date.now() - activation.ts < 5000) {
-          // Kein Ereignis dazwischen -> der Klick/Enter davor hat ausgeloest.
+        } else if (activation.actionSeq === st['actionSeq'] && Date.now() - activation.ts < 5000) {
+          // Seit dem Klick/Enter gab es keine weitere AKTION. Bewusst nur
+          // Aktionen zaehlen: ein change-Ereignis zwischen Klick und submit ist
+          // ueblich (Seitenskript setzt ein Feld) und darf die Kausalitaet
+          // nicht zerreissen - sonst wird beim Replay doppelt abgeschickt.
           causedBy = activation.id;
           causeKind = 'sequence';
         }
       }
       wprFlushPending(null);
+      st['actionSeq'] = (st['actionSeq'] as number) + 1;
       wprEmit({ kind: 'submit', target: describe(form), causedBy: causedBy, causeKind: causeKind });
   }
   document.addEventListener('submit', onSubmit, true);
@@ -662,6 +728,13 @@ export async function attachRecorder(
       const target = flowPath(config, flowName);
       mkdirSync(config.flowsDirAbs, { recursive: true });
       const out = createWriteStream(target, { flags: 'w' });
+      // Ohne diesen Listener beendet ein Schreibfehler (Verzeichnis statt
+      // Datei, volle Platte) den ganzen Prozess - beim MCP-Server waere das
+      // der Serverabsturz mitten in einer Aufnahme.
+      out.on('error', (err) => {
+        log.error(`Schreibfehler in ${target}: ${err.message}. Aufnahme wird beendet.`);
+        sink = null;
+      });
       stream = out;
       name = flowName;
       index = 0;

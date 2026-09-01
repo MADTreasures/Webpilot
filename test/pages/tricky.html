@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="de">
+<head><meta charset="utf-8"><title>Knifflige Faelle</title>
+<style>body{font-family:system-ui,sans-serif;margin:2rem}</style></head>
+<body>
+  <h1>Knifflige Faelle</h1>
+
+  <!-- Enter auf einem Link: der Browser erzeugt dabei selbst einen Klick. -->
+  <p><a id="enter-link" href="/about">Zur Seite ueber diese Seite</a></p>
+
+  <!-- aria-hidden: der Accessible Name der beiden Knoepfe unterscheidet sich
+       nur, wenn aria-hidden beim Namen ignoriert wird. -->
+  <p>
+    <button id="ariah-1">Weiter <span aria-hidden="true">jetzt</span></button>
+    <button id="ariah-2"><span aria-hidden="true">Schritt</span>Weiter jetzt</button>
+  </p>
+
+  <!-- :text-is vergleicht den UNMITTELBAREN Text: "Alpha" trifft beide divs. -->
+  <div class="karte">Alpha</div>
+  <div class="karte">Alpha<span>Beta</span></div>
+
+  <!-- Zwei Felder, die ein Skript nacheinander fuellt (wie ein Passwortmanager). -->
+  <form id="auto-form" method="post" action="/login">
+    <label for="auto-user">Benutzername</label>
+    <input id="auto-user" name="user" type="text">
+    <label for="auto-pass">Passwort</label>
+    <input id="auto-pass" name="password" type="password" autocomplete="current-password">
+    <button type="submit" data-testid="auto-submit">Absenden</button>
+  </form>
+
+  <!-- Verzoegerte Navigation: beim Klick passiert erst einmal nichts. -->
+  <p><button id="slow" data-testid="slow-go">Langsam weiter</button></p>
+  <script>
+    document.getElementById('slow').addEventListener('click', () => {
+      setTimeout(() => { location.href = '/welcome?user=langsam'; }, 700);
+    });
+  </script>
+</body>
+</html>
