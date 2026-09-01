@@ -8,6 +8,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { readFileSync, rmSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { startTestServer } from './server.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -127,7 +128,7 @@ try {
   check('ref nach Navigation -> Tool-Error mit Hinweis auf neuen Snapshot',
     staleRef.isError === true && textOf(staleRef).includes('browser_snapshot'), textOf(staleRef).split('\n')[0]);
   check('der Fehler nennt den Grund (Referenzen werden pro Dokument neu vergeben)',
-    textOf(staleRef).includes('navigiert'), textOf(staleRef).slice(0, 90));
+    textOf(staleRef).includes('neues Dokument'), textOf(staleRef).slice(0, 90));
 
   const stopped = await client.callTool({ name: 'record_stop', arguments: {} });
   check('record_stop schreibt den Flow', !stopped.isError && textOf(stopped).includes('mcp-login.jsonl'), textOf(stopped));
@@ -166,6 +167,60 @@ try {
   check('Snapshot schwaerzt das Passwort mit {{secret:...}}', filled.includes('{{secret:password}}'),
     filled.split('\n').filter((l) => l.includes('secret')).join(' | '));
 
+  /* ---------- Passwort in einer Shadow-Root und mit Sonderzeichen ---------- */
+  await client.callTool({ name: 'browser_open', arguments: { url: `${origin}/shadow` } });
+  const sh1 = await client.callTool({ name: 'browser_snapshot', arguments: {} });
+  const shPw = (textOf(sh1).match(/textbox "Passwort"[^\n]*\[ref=(\S+?)\]/) ?? [])[1];
+  await client.callTool({ name: 'browser_type', arguments: { ref: shPw, text: 'schatten  wert\\99' } });
+  const sh2 = textOf(await client.callTool({ name: 'browser_snapshot', arguments: {} }));
+  check('Passwort in einer offenen Shadow-Root wird geschwaerzt',
+    !sh2.includes('schatten') && sh2.includes('{{secret:'),
+    sh2.split('\n').filter((l) => l.includes('Passwort')).join(' | '));
+
+  /* ---------- autocomplete als Tokenliste ---------- */
+  await client.callTool({ name: 'browser_open', arguments: { url: `${origin}/tricky` } });
+  const tk1 = await client.callTool({ name: 'browser_snapshot', arguments: {} });
+  const tkRef = (textOf(tk1).match(/textbox "Tokenpasswort"[^\n]*\[ref=(\S+?)\]/) ?? [])[1];
+  await client.callTool({ name: 'browser_type', arguments: { ref: tkRef, text: 'tokengeheim77' } });
+  const tk2 = textOf(await client.callTool({ name: 'browser_snapshot', arguments: {} }));
+  check('autocomplete-Tokenliste zaehlt als Passwortfeld',
+    !tk2.includes('tokengeheim77'), tk2.split('\n').filter((l) => l.includes('Tokenpasswort')).join(' | '));
+
+  /* ---------- pushState entwertet die Referenzen nicht ---------- */
+  const ps1 = await client.callTool({ name: 'browser_snapshot', arguments: {} });
+  const psRef = (textOf(ps1).match(/button "URL umschreiben"[^\n]*\[ref=(\S+?)\]/) ?? [])[1];
+  const psClick = await client.callTool({ name: 'browser_click', arguments: { ref: psRef } });
+  check('Klick auf den pushState-Button geht durch', !psClick.isError, textOf(psClick).split('\n')[0]);
+  const psAgain = await client.callTool({ name: 'browser_click', arguments: { ref: psRef } });
+  check('pushState entwertet die Referenzen NICHT (gleiches Dokument)',
+    !psAgain.isError, textOf(psAgain).split('\n')[0]);
+
+  /* ---------- ungueltiger Profilname kostet nicht die laufende Sitzung ---------- */
+  const badProfile = await client.callTool({ name: 'browser_open', arguments: { profile: '../ausbruch' } });
+  check('browser_open mit ungueltigem Profilnamen -> Tool-Error', badProfile.isError === true,
+    textOf(badProfile).split('\n')[0]);
+  const stillThere = await client.callTool({ name: 'browser_snapshot', arguments: {} });
+  check('die laufende Sitzung ueberlebt den ungueltigen Profilnamen',
+    !stillThere.isError, textOf(stillThere).split('\n')[0]);
+
+  /* ---------- Aufnahme ohne abschliessende Aktion verliert nichts ---------- */
+  await client.callTool({ name: 'browser_open', arguments: { url: `${origin}/` } });
+  await client.callTool({ name: 'record_start', arguments: { name: 'ohne-abschluss' } });
+  const os1 = await client.callTool({ name: 'browser_snapshot', arguments: {} });
+  const osUser = (textOf(os1).match(/textbox "Benutzername"[^\n]*\[ref=(\S+?)\]/) ?? [])[1];
+  const osPass = (textOf(os1).match(/textbox "Passwort"[^\n]*\[ref=(\S+?)\]/) ?? [])[1];
+  await client.callTool({ name: 'browser_type', arguments: { ref: osUser, text: 'demo' } });
+  await client.callTool({ name: 'browser_type', arguments: { ref: osPass, text: 'letzter-wert-99' } });
+  await client.callTool({ name: 'record_stop', arguments: {} });
+  const osLines = readFileSync(resolve(TMP, 'flows/ohne-abschluss.jsonl'), 'utf8')
+    .trim().split('\n').map(JSON.parse);
+  check('zuletzt eingegebener Wert geht beim Stoppen nicht verloren',
+    osLines.filter((e) => e.kind === 'fill').length === 2,
+    JSON.stringify(osLines.map((e) => e.kind)));
+  check('auch dieser letzte Wert ist maskiert',
+    !JSON.stringify(osLines).includes('letzter-wert-99') &&
+      osLines.some((e) => e.kind === 'fill' && e.value === '{{secret:password}}'));
+
   const tail = await client.callTool({ name: 'log_tail', arguments: { n: 5 } });
   const tailText = textOf(tail);
   check('log_tail liefert die letzten Logzeilen', !tail.isError && /\d{4}-\d\d-\d\dT.*\[(replay|mcp|browser|recorder)\]/.test(tailText),
@@ -176,8 +231,31 @@ try {
     `${serverLog.join('').length} Zeichen stderr`);
 } finally {
   await client.close();
-  httpServer.close();
 }
+
+/* ---------- Sauberes Herunterfahren: Signal und stdin-Ende ---------- */
+async function shutdownProbe(label, stop) {
+  const child = spawn(process.execPath, ['dist/cli.js', 'mcp', '--profile', 'shutdown', '--config', '.tmp-test/config.json'], {
+    cwd: ROOT,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, WEBPILOT_HEADLESS: '1' },
+  });
+  let err = '';
+  child.stderr.on('data', (c) => { err += String(c); });
+  await new Promise((r) => setTimeout(r, 1200));
+  stop(child);
+  const code = await Promise.race([
+    new Promise((r) => child.once('exit', (c, sig) => r({ c, sig }))),
+    new Promise((r) => setTimeout(() => r({ c: 'TIMEOUT', sig: null }), 8000)),
+  ]);
+  if (code.c === 'TIMEOUT') child.kill('SIGKILL');
+  check(label, code.c === 0, `exit=${JSON.stringify(code)} ${err.includes('Maximum call stack') ? 'STACK-OVERFLOW!' : ''}`);
+}
+
+await shutdownProbe('SIGTERM beendet den Server sauber (Exit 0)', (c) => c.kill('SIGTERM'));
+await shutdownProbe('stdin-Ende beendet den Server sauber (Exit 0)', (c) => c.stdin.end());
+
+httpServer.close();
 
 console.log(fails === 0 ? '\nALLE MCP-CHECKS BESTANDEN' : `\n${fails} MCP-CHECK(S) FEHLGESCHLAGEN`);
 process.exit(fails === 0 ? 0 : 1);

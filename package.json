@@ -16,7 +16,7 @@
     "open": "npm run build && node dist/cli.js open",
     "record": "npm run build && node dist/cli.js record",
     "replay": "npm run build && node dist/cli.js replay",
-    "mcp": "npm run build 1>&2 && node dist/cli.js mcp",
+    "mcp": "node dist/cli.js mcp",
     "testpage": "node test/server.mjs",
     "test:e2e": "npm run build && node test/e2e.mjs",
     "test:mcp": "npm run build && node test/mcp-client.mjs",

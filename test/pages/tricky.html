@@ -28,9 +28,26 @@
     <button type="submit" data-testid="auto-submit">Absenden</button>
   </form>
 
+  <!-- type=text mit autocomplete-TOKENLISTE: laut HTML-Spec regulaer, und
+       genau das, was ein "Passwort anzeigen"-Schalter hinterlaesst. -->
+  <p>
+    <label for="tokenpass">Tokenpasswort</label>
+    <input id="tokenpass" name="tokenpass" type="text" autocomplete="section-blau billing current-password">
+  </p>
+
+  <!-- Same-Document-Navigation: die URL aendert sich, das Dokument nicht. -->
+  <p><button id="pushstate" data-testid="pushstate">URL umschreiben</button></p>
+
+  <!-- Popup auf einen Redirector der erlaubten Domain, der auf eine nicht
+       gelistete Domain zeigt. -->
+  <p><a id="popup-link" data-testid="popup-link" target="_blank" href="/redirect?to=%%REDIRECT%%">Im neuen Tab oeffnen</a></p>
+
   <!-- Verzoegerte Navigation: beim Klick passiert erst einmal nichts. -->
   <p><button id="slow" data-testid="slow-go">Langsam weiter</button></p>
   <script>
+    document.getElementById('pushstate').addEventListener('click', () => {
+      history.pushState({}, '', '/tricky?seite=' + Date.now());
+    });
     document.getElementById('slow').addEventListener('click', () => {
       setTimeout(() => { location.href = '/welcome?user=langsam'; }, 700);
     });

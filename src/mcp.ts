@@ -14,7 +14,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { Page } from 'playwright';
 import { z } from 'zod';
-import { createSession, type Session } from './browser.js';
+import { createSession, profileDirFor, type Session } from './browser.js';
 import { isAllowedUrl, loadConfig, type ResolvedConfig } from './config.js';
 import { createLogger, formatEntry, logTail } from './log.js';
 import { isValidFlowName } from './recorder.js';
@@ -41,6 +41,8 @@ export interface SecretValue {
   field: string;
   /** Nur zum Schwaerzen. Dieser Wert wird nie geloggt und nie zurueckgegeben. */
   value: string;
+  /** Accessible Name des Feldes - damit laesst sich die Snapshot-Zeile finden. */
+  name: string;
 }
 
 /**
@@ -57,17 +59,41 @@ export async function collectSecretValues(page: Page): Promise<SecretValue[]> {
   for (const frame of page.frames()) {
     try {
       const found = await frame.evaluate(() => {
-        const list: Array<{ field: string; value: string }> = [];
-        const inputs = document.querySelectorAll('input');
-        for (let i = 0; i < inputs.length; i++) {
-          const el = inputs[i] as HTMLInputElement | undefined;
-          if (!el) continue;
-          const type = (el.getAttribute('type') ?? '').toLowerCase();
-          const autocomplete = (el.getAttribute('autocomplete') ?? '').toLowerCase();
-          const isSecret =
-            type === 'password' || autocomplete === 'current-password' || autocomplete === 'new-password';
-          if (!isSecret || !el.value) continue;
-          list.push({ field: el.getAttribute('name') || el.id || 'passwort', value: el.value });
+        const list: Array<{ field: string; value: string; name: string }> = [];
+        // Auch durch offene Shadow-Roots laufen: der Snapshot zeigt deren
+        // Inhalt, querySelectorAll allein sieht ihn nicht.
+        const roots: Array<Document | ShadowRoot> = [document];
+        for (let r = 0; r < roots.length && r < 200; r++) {
+          const root = roots[r];
+          if (!root) continue;
+          const all = root.querySelectorAll('*');
+          for (let i = 0; i < all.length; i++) {
+            const el = all[i] as (Element & { shadowRoot?: ShadowRoot | null }) | undefined;
+            if (el?.shadowRoot) roots.push(el.shadowRoot);
+          }
+          const inputs = root.querySelectorAll('input');
+          for (let i = 0; i < inputs.length; i++) {
+            const el = inputs[i] as HTMLInputElement | undefined;
+            if (!el) continue;
+            const type = (el.getAttribute('type') ?? '').toLowerCase();
+            // autocomplete ist eine TOKENLISTE: "section-blau current-password"
+            // ist voellig regulaer.
+            const tokens = (el.getAttribute('autocomplete') ?? '').toLowerCase().split(/\s+/);
+            const isSecret =
+              type === 'password' ||
+              tokens.indexOf('current-password') !== -1 ||
+              tokens.indexOf('new-password') !== -1;
+            if (!isSecret || !el.value) continue;
+            const label = el.labels && el.labels.length > 0 ? (el.labels[0]?.textContent ?? '') : '';
+            const accName = (el.getAttribute('aria-label') || label || el.getAttribute('placeholder') || '')
+              .replace(/\s+/g, ' ')
+              .trim();
+            list.push({
+              field: el.getAttribute('name') || el.id || 'passwort',
+              value: el.value,
+              name: accName,
+            });
+          }
         }
         return list;
       });
@@ -82,22 +108,55 @@ export async function collectSecretValues(page: Page): Promise<SecretValue[]> {
 /**
  * Ersetzt Passwortwerte im Snapshot durch {{secret:<feld>}}.
  *
- * Zuerst praezise am Zeilenende (dort steht der Feldwert im Snapshot), danach
- * global, falls die Seite den Wert an anderer Stelle wiederholt. Bei sehr
- * kurzen Passwoertern schwaerzt der zweite Schritt mehr als noetig - das ist
- * die richtige Richtung, in die ein solcher Filter irren darf.
+ * Zwei Wege, weil einer allein nicht reicht:
+ *
+ * 1. STRUKTURELL. Eine Snapshot-Zeile sieht aus wie
+ *      - textbox "Passwort" [ref=e4]: geheim
+ *    Steht in den Anfuehrungszeichen der Name eines bekannten Passwortfeldes,
+ *    wird alles hinter `]: ` ersetzt - egal, wie der Wert dargestellt wird.
+ *    Das ist der verlaessliche Weg: der Snapshot normalisiert Whitespace und
+ *    escaped Backslashes und Anfuehrungszeichen im YAML-Stil, ein Vergleich
+ *    mit dem Rohwert geht dabei ins Leere.
+ * 2. UEBER DEN WERT, in mehreren Darstellungen, falls die Seite ihn anderswo
+ *    wiederholt oder das Feld keinen brauchbaren Namen hat. Bei sehr kurzen
+ *    Passwoertern schwaerzt das mehr als noetig - das ist die richtige
+ *    Richtung, in die ein solcher Filter irren darf.
  */
 export function redactSecrets(snapshot: string, secrets: readonly SecretValue[]): string {
-  let result = snapshot;
+  if (secrets.length === 0) return snapshot;
+
+  const byName = new Map<string, string>();
+  for (const secret of secrets) {
+    if (secret.name) byName.set(secret.name, `{{secret:${secret.field}}}`);
+  }
+
+  const valueLine = /^(\s*-\s.*?\[ref=[^\]]+\]\s*:\s*)(.+)$/;
+  const namedNode = /"((?:[^"\\]|\\.)*)"/;
+
+  let result = snapshot
+    .split('\n')
+    .map((line) => {
+      const parts = valueLine.exec(line);
+      if (!parts) return line;
+      const head = parts[1] ?? '';
+      const nameMatch = namedNode.exec(head);
+      const nodeName = nameMatch?.[1];
+      if (nodeName === undefined) return line;
+      const placeholder = byName.get(nodeName.replace(/\\(.)/g, '$1'));
+      return placeholder === undefined ? line : `${head}${placeholder}`;
+    })
+    .join('\n');
+
   for (const secret of secrets) {
     if (!secret.value) continue;
     const placeholder = `{{secret:${secret.field}}}`;
-    const suffix = `: ${secret.value}`;
-    result = result
-      .split('\n')
-      .map((line) => (line.endsWith(suffix) ? `${line.slice(0, line.length - secret.value.length)}${placeholder}` : line))
-      .join('\n');
-    result = result.split(secret.value).join(placeholder);
+    const normalized = secret.value.replace(/\s+/g, ' ').trim();
+    const yamlEscaped = secret.value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const normalizedYaml = normalized.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    for (const variant of [secret.value, normalized, yamlEscaped, normalizedYaml]) {
+      if (!variant) continue;
+      result = result.split(variant).join(placeholder);
+    }
   }
   return result;
 }
@@ -120,23 +179,25 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
   let session: Session | null = null;
 
   /**
-   * Snapshot-Referenzen sind NUR innerhalb eines Snapshots stabil. Bei einem
+   * Snapshot-Referenzen sind NUR innerhalb eines Dokuments stabil. Bei einem
    * neuen Dokument beginnt Playwright die Nummerierung wieder bei e1 - ein
    * altes e11 zeigt danach nicht ins Leere, sondern moeglicherweise auf ein
-   * ganz anderes Element. Deshalb wird pro Seite mitgezaehlt, wie oft der
-   * Hauptframe navigiert ist, und beim Zugriff mit dem Stand zum
-   * Snapshot-Zeitpunkt verglichen.
+   * ganz anderes Element.
+   *
+   * Erkannt wird das ueber eine Markierung IM Dokument, nicht ueber einen
+   * Navigationszaehler: framenavigated feuert auch bei pushState, replaceState
+   * und Hash-Wechseln. Dabei bleibt das Dokument dasselbe und die Referenzen
+   * gueltig - eine SPA, die die URL periodisch umschreibt, wuerde sonst jeden
+   * Snapshot sofort entwerten.
    */
-  const navCount = new WeakMap<Page, number>();
-  let lastSnapshot: { page: Page; nav: number } | null = null;
-
-  const watchNavigations = (page: Page): void => {
-    navCount.set(page, navCount.get(page) ?? 0);
-    page.on('framenavigated', (frame) => {
-      if (frame !== page.mainFrame()) return;
-      navCount.set(page, (navCount.get(page) ?? 0) + 1);
+  const documentToken = async (page: Page): Promise<string> =>
+    page.evaluate(() => {
+      const w = window as unknown as { __webpilotDoc?: string };
+      if (!w.__webpilotDoc) w.__webpilotDoc = Math.random().toString(36).slice(2);
+      return w.__webpilotDoc;
     });
-  };
+
+  let lastSnapshot: { page: Page; token: string } | null = null;
 
   const requireSession = (): Session => {
     if (!session) {
@@ -166,14 +227,12 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
       created.context.on('close', () => {
         if (session === created) session = null;
       });
-      for (const page of created.context.pages()) watchNavigations(page);
-      created.context.on('page', watchNavigations);
       session = created;
     }
     return session;
   };
 
-  const resolveRef = (page: Page, ref: string) => {
+  const resolveRef = async (page: Page, ref: string) => {
     if (!REF_PATTERN.test(ref)) {
       throw new Error(
         `"${ref}" ist keine gueltige Referenz. Refs stammen aus browser_snapshot und sehen aus wie e12 oder f1e3.`,
@@ -182,11 +241,12 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
     if (!lastSnapshot) {
       throw new Error('Es gibt noch keinen Snapshot. Zuerst browser_snapshot aufrufen.');
     }
-    if (lastSnapshot.page !== page || (navCount.get(page) ?? 0) !== lastSnapshot.nav) {
+    const token = await documentToken(page).catch(() => '');
+    if (lastSnapshot.page !== page || token !== lastSnapshot.token) {
       throw new Error(
-        `Die Seite hat seit dem letzten browser_snapshot navigiert. Referenzen werden pro Dokument ` +
-          `neu vergeben, "${ref}" wuerde jetzt auf ein anderes Element zeigen - bitte browser_snapshot ` +
-          `erneut aufrufen und mit den neuen Referenzen arbeiten.`,
+        `Die Seite hat seit dem letzten browser_snapshot ein neues Dokument geladen. Referenzen werden ` +
+          `pro Dokument neu vergeben, "${ref}" wuerde jetzt auf ein anderes Element zeigen - bitte ` +
+          `browser_snapshot erneut aufrufen und mit den neuen Referenzen arbeiten.`,
       );
     }
     return page.locator(`aria-ref=${ref}`);
@@ -245,6 +305,9 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
     },
     async ({ profile, url }) => {
       const target = profile ?? defaultProfile;
+      // Erst pruefen, dann schliessen: ein Tippfehler im Profilnamen darf nicht
+      // die laufende Sitzung samt manuell durchgefuehrtem Login kosten.
+      profileDirFor(config, target);
       if (url !== undefined && !isAllowedUrl(url, config.allowedDomains)) {
         throw new Error(
           `Navigation nach ${url} abgelehnt: Domain steht nicht in der Allowlist ` +
@@ -288,7 +351,7 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
         const secrets = await collectSecretValues(page);
         const safe = redactSecrets(snapshot, secrets);
         if (secrets.length > 0) log.info(`${secrets.length} Passwortwert(e) im Snapshot geschwaerzt.`);
-        lastSnapshot = { page, nav: navCount.get(page) ?? 0 };
+        lastSnapshot = { page, token: await documentToken(page) };
         return text(`URL: ${page.url()}\nTitel: ${await page.title()}\n\n${safe}`);
       }),
   );
@@ -304,7 +367,7 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
       exclusive(async () => {
         const page = requireSession().page();
         await withRefError(ref, async () => {
-          await resolveRef(page, ref).click();
+          await (await resolveRef(page, ref)).click();
         });
         return text(`Geklickt: ${ref}\nAktuelle URL: ${page.url()}`);
       }),
@@ -325,7 +388,7 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
         const page = requireSession().page();
         let mode = 'fill';
         await withRefError(ref, async () => {
-          const locator = resolveRef(page, ref);
+          const locator = await resolveRef(page, ref);
           try {
             // fill() setzt den Wert in einem Rutsch - richtig fuer Formularfelder.
             await locator.fill(value);
@@ -347,13 +410,13 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
     'browser_screenshot',
     {
       title: 'Screenshot',
-      description: 'Erstellt einen PNG-Screenshot der aktuellen Seite und liefert ihn als Bild zurueck.',
-      inputSchema: { fullPage: z.boolean().default(false).describe('Ganze Seite statt nur des sichtbaren Bereichs') },
+      description: 'Erstellt einen PNG-Screenshot des sichtbaren Bereichs und liefert ihn als Bild zurueck.',
+      inputSchema: {},
     },
-    async ({ fullPage }) =>
+    async () =>
       exclusive(async () => {
         const page = requireSession().page();
-        const buffer = await page.screenshot({ fullPage, type: 'png' });
+        const buffer = await page.screenshot({ type: 'png' });
         if (buffer.length > MAX_SCREENSHOT_BYTES) {
           // Ein ganzseitiger PNG einer echten Seite kann mehrere Megabyte gross
           // sein; base64-codiert sprengt das jedes Kontextfenster. Dann lieber
@@ -363,8 +426,7 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
           writeFileSync(file, buffer);
           return text(
             `Screenshot von ${page.url()} ist mit ${buffer.length} Bytes zu gross fuer eine Antwort ` +
-              `(Grenze ${MAX_SCREENSHOT_BYTES}). Datei: ${file}\n` +
-              `Tipp: ohne fullPage aufrufen, dann wird nur der sichtbare Bereich aufgenommen.`,
+              `(Grenze ${MAX_SCREENSHOT_BYTES}). Datei: ${file}`,
           );
         }
         return {
@@ -519,15 +581,33 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
 export async function runMcpServer(options: McpOptions = {}): Promise<void> {
   const webpilot = createMcpServer(options);
   const transport = new StdioServerTransport();
-  await webpilot.server.connect(transport);
-  log.info('MCP-Server laeuft ueber stdio.');
 
-  await new Promise<void>((resolve) => {
-    const shutdown = () => {
-      void webpilot.close().finally(resolve);
+  await new Promise<void>((resolve, reject) => {
+    // Wiedereintritt sperren: close() schliesst den Transport, der ruft
+    // onclose - ohne diese Sperre ruft sich der Shutdown selbst auf, bis der
+    // Stack voll ist (RangeError statt sauberem Ende).
+    let closing = false;
+    const shutdown = (): void => {
+      if (closing) return;
+      closing = true;
+      webpilot
+        .close()
+        .catch((err: unknown) => log.warn(`Fehler beim Herunterfahren: ${(err as Error).message}`))
+        .finally(resolve);
     };
+
     transport.onclose = shutdown;
+    transport.onerror = (err) => log.warn(`Transportfehler: ${err.message}`);
+    // Verschwindet der Host ohne Signal (Absturz, gekappte Pipe), bleibt sonst
+    // ein sichtbares Browserfenster stehen und der Prozess laeuft ewig weiter.
+    process.stdin.once('end', shutdown);
+    process.stdin.once('close', shutdown);
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
+
+    webpilot.server.connect(transport).then(
+      () => log.info('MCP-Server laeuft ueber stdio.'),
+      (err: unknown) => reject(err instanceof Error ? err : new Error(String(err))),
+    );
   });
 }

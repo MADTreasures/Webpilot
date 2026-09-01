@@ -67,9 +67,14 @@ Durchgesetzt wird sie in zwei Schichten:
 1. **Vorab im Route-Handler.** Ist die Ziel-URL nicht erlaubt, wird der Request
    abgebrochen, bevor er das Geraet verlaesst. Im Log steht dann
    `Navigation blockiert: <url>`, die aktuelle Seite bleibt unveraendert stehen.
-2. **Reissleine auf `framenavigated`.** Committet der Hauptframe trotzdem eine
-   nicht erlaubte URL, wird die Seite sofort verlassen und der Vorgang als
-   `ERROR` protokolliert.
+2. **Reissleine.** Committet der Hauptframe trotzdem eine nicht erlaubte URL,
+   wird die Seite sofort verlassen und der Vorgang als `ERROR` protokolliert.
+   Geprueft wird bei jedem `framenavigated` **und** sofort, wenn eine neue Seite
+   auftaucht: bei einem Popup ist die Erstnavigation bereits abgeschlossen, wenn
+   Playwright davon berichtet, ein `framenavigated` kommt dazu nicht mehr. Ein
+   Popup auf einer nicht gelisteten Domain wird geschlossen (`goto` liefe dort
+   ins Leere, solange die Erstnavigation noch laeuft), eine normale Seite
+   wechselt auf `about:blank`.
 
 Die zweite Schicht ist noetig, weil Playwright den Route-Handler bei einem
 **Server-Redirect nicht erneut aufruft**: eine erlaubte URL, die per 302 auf
@@ -97,7 +102,7 @@ Ueber die npm-Skripte (bauen jeweils vorher):
 npm run open   -- --profile privat --url https://example.com
 npm run record -- login --profile privat --url https://example.com/login
 npm run replay -- login --profile privat
-npm run mcp
+npm run build && npm run --silent mcp
 ```
 
 Optionen:
@@ -207,7 +212,7 @@ Replay "login" abgebrochen bei Ereignis #4 (fill).
 ## MCP-Server
 
 ```bash
-npm run mcp
+npm run build && npm run --silent mcp
 ```
 
 Der Server spricht JSON-RPC ueber **stdout**; jede Logzeile geht auf **stderr**.
@@ -241,7 +246,15 @@ Ein paar Eigenschaften, die man kennen sollte:
   Feldwerte im Klartext, auch die von Passwortfeldern. Auf einer Seite mit
   gespeichertem oder automatisch gefuelltem Login waere jeder Snapshot sonst
   ein Passwort-Leak ins Transkript. webpilot ersetzt solche Werte vor der
-  Rueckgabe durch `{{secret:<feld>}}`.
+  Rueckgabe durch `{{secret:<feld>}}` — auch in offenen Shadow-Roots, und auch
+  dann, wenn der Snapshot den Wert normalisiert oder YAML-escaped darstellt
+  (dafuer wird die Zeile ueber den Feldnamen gefunden, nicht ueber den Wert).
+- **Referenzen ueberleben `pushState`.** Entwertet wird nur bei einem echten
+  Dokumentwechsel; erkannt wird der ueber eine Markierung im Dokument, nicht
+  ueber einen Navigationszaehler. Eine SPA, die die URL periodisch umschreibt,
+  wuerde sonst jeden Snapshot sofort entwerten.
+- **`browser_open` prueft den Profilnamen zuerst.** Ein Tippfehler kostet nicht
+  die laufende Sitzung samt manuell durchgefuehrtem Login.
 - **Aufrufe werden serialisiert.** Das SDK laesst Tool-Aufrufe parallel laufen;
   auf einer geteilten Seite entwertet ein navigierender `browser_click` genau
   die Referenzen, die ein gleichzeitiger `browser_snapshot` gerade ausgibt.
@@ -249,9 +262,17 @@ Ein paar Eigenschaften, die man kennen sollte:
 - **`browser_type` benutzt `fill()`** — ein Rutsch, richtig fuer Formularfelder.
   Nur wenn das Ziel nicht fuellbar ist, wird echt getippt (`pressSequentially`),
   damit Typeahead und Validierung der Seite laufen.
-- **`browser_screenshot`** liefert PNG. Ab 2 MB wird das Bild nicht eingebettet,
-  sondern nach `screenshots/` geschrieben und nur der Pfad gemeldet — ein
-  ganzseitiger Screenshot einer echten Seite sprengt sonst jedes Kontextfenster.
+- **`browser_screenshot`** liefert ein PNG des sichtbaren Bereichs. Ab 2 MB wird
+  das Bild nicht eingebettet, sondern nach `screenshots/` geschrieben und nur
+  der Pfad gemeldet — sonst sprengt es das Kontextfenster.
+- **Der Server beendet sich, wenn der Host verschwindet.** Auf `SIGINT`,
+  `SIGTERM` und auf ein Ende von stdin; sonst bliebe ein sichtbares
+  Browserfenster stehen und der Prozess liefe weiter.
+- **`record_stop` holt den zuletzt eingegebenen Wert ab.** Ein gerade getippter
+  Feldwert wartet noch auf sein ausloesendes Ereignis (Klick, Enter,
+  Fokuswechsel). Endet die Aufnahme direkt nach der Eingabe, kommt das nie —
+  `record_stop` stoesst deshalb in jedem Frame einen Flush an und wartet ab, bis
+  die Meldung angekommen ist.
 - **`log_tail` sieht nur diesen Prozess.** Der Ringpuffer gehoert dem laufenden
   MCP-Server; Zeilen aus einem separaten `webpilot record`-Lauf stehen nicht
   darin.
@@ -290,9 +311,10 @@ Auf einem Rechner ohne Bildschirm zusaetzlich `"WEBPILOT_HEADLESS": "1"` in
 Als `command` gehoert hier `node` hin, nicht `npm`: `npm run mcp` schreibt
 seinen eigenen Banner auf **stdout**, und dort laeuft das JSON-RPC-Protokoll.
 Der SDK-Client verkraftet die zwei Zeilen zwar (nicht parsebare Zeilen werden
-gemeldet und uebersprungen), aber sauber ist es nicht. Fuer den manuellen Test
-ist `npm run mcp` in Ordnung — der Build-Schritt darin schreibt bereits nach
-stderr, damit wenigstens `tsc` das Protokoll nicht stoert.
+gemeldet und uebersprungen), aber sauber ist es nicht. Das Skript `mcp` startet
+deshalb nur noch `node dist/cli.js mcp` ohne vorgeschalteten Build — `npm run
+build` gehoert davor. Wer es trotzdem ueber npm starten will: `npm run --silent
+mcp` unterdrueckt den Banner.
 
 Der Standard-Timeout des SDK-Clients liegt bei 60 s. Der allererste Aufruf von
 `browser_open` startet einen Chromium und kann bei kaltem Cache laenger

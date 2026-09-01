@@ -557,9 +557,12 @@ export function wpIsPassword(el: unknown): boolean {
   if (e.localName !== 'input') return false;
   const type = (e.getAttribute('type') || '').toLowerCase();
   if (type === 'password') return true;
-  const autocomplete = (e.getAttribute('autocomplete') || '').toLowerCase();
+  // autocomplete ist eine TOKENLISTE: "section-blau billing current-password"
+  // ist laut HTML-Spezifikation regulaer. Ein Vergleich auf Gleichheit wuerde
+  // genau die Felder verfehlen, fuer die dieser Zweig existiert.
+  const tokens = (e.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/);
   // new-password gehoert genauso wenig ins Log wie current-password.
-  return autocomplete === 'current-password' || autocomplete === 'new-password';
+  return tokens.indexOf('current-password') !== -1 || tokens.indexOf('new-password') !== -1;
 }
 
 /**

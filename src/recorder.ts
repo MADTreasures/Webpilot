@@ -119,6 +119,8 @@ export function wprState(): Record<string, unknown> {
       actionSeq: 0,
       /** Bereits verarbeitete Event-Objekte - siehe ensureRoot. */
       seenEvents: new WeakSet<object>(),
+      /** Noch nicht bestaetigte Binding-Aufrufe - fuer den Flush beim Stoppen. */
+      inflight: [] as unknown[],
       /** Letzter bereits gemeldeter Wert je Element - verhindert doppelte fills. */
       lastValues: new WeakMap<object, string>(),
       /** Gesetzt waehrend der Task, in der Enter verarbeitet wird. */
@@ -161,8 +163,15 @@ export function wprFlush(): void {
       // Ohne catch entstuende in der aufgezeichneten Seite ein
       // unhandledrejection - ausgerechnet dort, wo wir nichts kaputtmachen wollen.
       const result = (sink as (v: unknown) => unknown)(item);
-      if (result && typeof (result as { catch?: unknown }).catch === 'function') {
-        (result as { catch: (fn: () => void) => void }).catch(() => {});
+      if (result && typeof (result as { then?: unknown }).then === 'function') {
+        const promise = result as Promise<unknown>;
+        const inflight = st['inflight'] as unknown[];
+        inflight.push(promise);
+        const drop = (): void => {
+          const at = inflight.indexOf(promise);
+          if (at !== -1) inflight.splice(at, 1);
+        };
+        promise.then(drop, drop);
       }
     } catch {
       // Kontext im Umbau (Navigation): das Ereignis ist verloren, nicht kritisch.
@@ -281,6 +290,21 @@ export function wprInstall(): void {
 
   const w = globalThis as unknown as Record<string, unknown>;
   w['__webpilotDescribe'] = wpDescribe;
+  /**
+   * Wird von record_stop in jedem Frame aufgerufen. Ohne das ginge der zuletzt
+   * eingegebene Feldwert verloren: der wartet noch auf sein ausloesendes
+   * Ereignis (Klick, Enter, Fokuswechsel), und wenn die Aufnahme direkt nach
+   * der Eingabe endet, kommt das nie. Die Funktion wartet ausserdem ab, bis
+   * die Meldungen wirklich in Node angekommen sind.
+   */
+  w['__webpilotFlushPending'] = function (): Promise<void> {
+    wprFlushPending(null);
+    const pendingCalls = (wprState()['inflight'] as unknown[]).slice() as Array<Promise<unknown>>;
+    return Promise.all(pendingCalls).then(
+      () => undefined,
+      () => undefined,
+    );
+  };
 
   const describe = (el: unknown): Record<string, unknown> => wpDescribe(el) as Record<string, unknown>;
 
@@ -719,7 +743,16 @@ export async function attachRecorder(
   for (const page of context.pages()) attachPage(page);
   context.on('page', attachPage);
 
-  return {
+  // Schliesst der Nutzer den Browser mitten in einer Aufnahme, wuerde das JSONL
+  // sonst nie geschlossen und record_stop faende keine Sitzung mehr.
+  context.on('close', () => {
+    if (!handle.isRecording()) return;
+    void handle.stop().catch((err: unknown) => {
+      log.warn(`Aufnahme konnte beim Schliessen nicht beendet werden: ${(err as Error).message}`);
+    });
+  });
+
+  const handle: RecorderHandle = {
     isRecording: () => sink !== null,
     currentName: () => name,
     eventCount: () => count,
@@ -773,7 +806,22 @@ export async function attachRecorder(
       const finishedName = name;
       const target = flowPath(config, finishedName);
       const out = stream;
-      // Erst alles Angestaute wegschreiben, dann die Senke schliessen.
+      // Zuerst die Seiten anstupsen: ein gerade getippter Feldwert wartet noch
+      // auf sein ausloesendes Ereignis und ginge sonst verloren.
+      for (const page of context.pages()) {
+        for (const frame of page.frames()) {
+          try {
+            await frame.evaluate(() => {
+              const flush = (window as unknown as { __webpilotFlushPending?: () => Promise<void> })
+                .__webpilotFlushPending;
+              return flush ? flush() : undefined;
+            });
+          } catch {
+            // Frame abgeloest oder Seite zu - dort gibt es nichts mehr zu holen.
+          }
+        }
+      }
+      // Dann alles Angestaute wegschreiben und die Senke schliessen.
       await queue;
       sink = null;
       stream = null;
@@ -785,4 +833,6 @@ export async function attachRecorder(
       return { name: finishedName, path: target, events: count };
     },
   };
+
+  return handle;
 }

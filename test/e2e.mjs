@@ -83,6 +83,17 @@ try {
     check('Redirect auf eine nicht gelistete Domain wird nicht gehalten',
       !s.page().url().startsWith(`http://localhost:${PORT}`), s.page().url());
 
+    // Popup auf einen Redirector der erlaubten Domain, der auf eine nicht
+    // gelistete Domain zeigt: die Erstnavigation eines Popups ist bereits
+    // committet, wenn Playwright das 'page'-Ereignis liefert.
+    await s.goto(`${origin}/tricky`);
+    await s.page().getByTestId('popup-link').click();
+    await s.page().waitForTimeout(2500);
+    const popupUrls = s.context.pages().map((pg) => pg.url());
+    check('Popup landet nicht auf einer nicht gelisteten Domain',
+      !popupUrls.some((u) => u.startsWith(`http://localhost:${PORT}`)), JSON.stringify(popupUrls));
+    for (const pg of s.context.pages().slice(1)) await pg.close();
+
     await s.goto(`${origin}/embed?src=${encodeURIComponent(`http://localhost:${PORT}/about`)}`);
     await s.page().waitForTimeout(1200);
     const subText = await s.page().frameLocator('#embedded').locator('h1').textContent().catch((e) => `ERR ${e}`);

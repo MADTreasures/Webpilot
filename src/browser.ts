@@ -134,19 +134,34 @@ export function installNavigationBackstop(
   context: BrowserContext,
   allowedDomains: readonly string[],
 ): void {
+  const leave = (page: Page, url: string, closePage: boolean): void => {
+    log.error(
+      `Nicht gelistete Domain erreicht: ${url} (vermutlich ueber einen Redirect). ` +
+        (closePage ? 'Die Seite wird geschlossen.' : 'Die Seite wird sofort verlassen.'),
+    );
+    // Bei einem frisch geoeffneten Popup laeuft goto('about:blank') ins Leere -
+    // die Erstnavigation ist noch in Arbeit. Ein Popup, das dort gar nicht sein
+    // duerfte, wird deshalb einfach geschlossen. Das letzte Fenster bleibt
+    // stehen, sonst faellt der ganze Kontext.
+    const action = closePage && context.pages().length > 1 ? page.close() : page.goto('about:blank', { waitUntil: 'commit' });
+    void Promise.resolve(action).catch((err: unknown) =>
+      log.warn(`Verlassen der Seite fehlgeschlagen: ${(err as Error).message}`),
+    );
+  };
+
   const guard = (page: Page): void => {
     page.on('framenavigated', (frame) => {
       if (frame !== page.mainFrame()) return;
       const url = frame.url();
       if (isAllowedUrl(url, allowedDomains)) return;
-      log.error(
-        `Nicht gelistete Domain erreicht: ${url} (vermutlich ueber einen Redirect). ` +
-          `Die Seite wird sofort verlassen.`,
-      );
-      void page
-        .goto('about:blank', { waitUntil: 'commit' })
-        .catch((err: unknown) => log.warn(`Verlassen der Seite fehlgeschlagen: ${(err as Error).message}`));
+      leave(page, url, false);
     });
+    // Sofort mitpruefen: bei einem Popup ist die Erstnavigation bereits
+    // committet, wenn das 'page'-Ereignis eintrifft - ein framenavigated dazu
+    // kommt nicht mehr (nachgemessen). Ein target=_blank-Link auf einen
+    // Redirector der erlaubten Domain landet sonst unbemerkt auf einer fremden.
+    const current = page.url();
+    if (current && !isAllowedUrl(current, allowedDomains)) leave(page, current, true);
   };
   for (const page of context.pages()) guard(page);
   context.on('page', guard);

@@ -74,7 +74,12 @@ export function createTestServer() {
       }
       if (path.startsWith('/frame/')) return send(res, 200, await page('login.html'));
       if (path === '/shadow') return send(res, 200, await page('shadow.html'));
-      if (path === '/tricky') return send(res, 200, await page('tricky.html'));
+      if (path === '/tricky') {
+        // %%REDIRECT%% zeigt per Default auf localhost - dieselbe Maschine,
+        // anderer Hostname, und damit ausserhalb einer 127.0.0.1-Allowlist.
+        const to = url.searchParams.get('redirect') ?? `http://localhost:${req.socket.localPort}/about`;
+        return send(res, 200, (await page('tricky.html')).replace('%%REDIRECT%%', encodeURIComponent(to)));
+      }
       if (path === '/redirect') {
         // 302 auf eine frei waehlbare URL - prueft die Allowlist gegen Redirects.
         const to = url.searchParams.get('to') ?? '/';
