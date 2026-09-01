@@ -13,6 +13,7 @@ import { join, resolve } from 'node:path';
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import { isAllowedUrl, loadConfig, type ResolvedConfig } from './config.js';
 import { createLogger } from './log.js';
+import { attachRecorder, type RecorderHandle } from './recorder.js';
 
 const log = createLogger('browser');
 
@@ -28,6 +29,11 @@ export interface SessionOptions {
 export interface Session {
   readonly context: BrowserContext;
   readonly config: ResolvedConfig;
+  /**
+   * Recorder. Binding und Init-Script sind bereits registriert; start/stop
+   * schalten nur die Senke um.
+   */
+  readonly recorder: RecorderHandle;
   readonly profile: string;
   readonly profileDir: string;
   /** Die aktuell aktive Seite. Wechselt, wenn die Seite geschlossen oder eine neue geoeffnet wird. */
@@ -117,6 +123,9 @@ export async function createSession(options: SessionOptions): Promise<Session> {
   });
 
   await installAllowlistGuard(context, config.allowedDomains);
+  // Recorder GENAU EINMAL pro Kontext anhaengen: exposeBinding wirft beim
+  // zweiten Aufruf mit demselben Namen.
+  const recorder = await attachRecorder(context, config);
   await options.onContextCreated?.(context);
 
   // launchPersistentContext liefert normalerweise bereits eine Seite (about:blank).
@@ -141,6 +150,7 @@ export async function createSession(options: SessionOptions): Promise<Session> {
   const session: Session = {
     context,
     config,
+    recorder,
     profile: options.profile,
     profileDir,
     page: () => {

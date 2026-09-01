@@ -94,7 +94,39 @@ async function main(): Promise<number> {
       process.off('SIGINT', onSigint);
       return 0;
     }
-    case 'record':
+    case 'record': {
+      const name = args.positional[0];
+      if (!name) {
+        process.stderr.write('record braucht einen Flow-Namen: webpilot record <name> --profile <profil>\n');
+        return 1;
+      }
+      const session = await createSession({
+        profile,
+        config,
+        ...(headless === undefined ? {} : { headless }),
+      });
+      const url = str(args, 'url');
+      await session.recorder.start(name);
+      if (url) await session.goto(url);
+      log.info(`Aufnahme "${name}" laeuft. Zum Beenden Browser schliessen oder Strg+C.`);
+      const finish = async () => {
+        if (session.recorder.isRecording()) {
+          const result = await session.recorder.stop();
+          log.info(`${result.events} Ereignisse in ${result.path}`);
+        }
+      };
+      const onSigint = () => {
+        void (async () => {
+          await finish();
+          await session.close();
+        })();
+      };
+      process.once('SIGINT', onSigint);
+      await session.closed();
+      process.off('SIGINT', onSigint);
+      await finish();
+      return 0;
+    }
     case 'replay':
     case 'mcp':
       process.stderr.write(`Kommando "${args.command}" ist noch nicht implementiert.\n`);
