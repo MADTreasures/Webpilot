@@ -179,7 +179,20 @@ export async function createSession(options: SessionOptions): Promise<Session> {
     headless,
     // Im sichtbaren Modus soll die Fenstergroesse gelten, nicht ein fixer Viewport.
     viewport: headless ? { width: 1280, height: 900 } : null,
-    args: ['--no-first-run', '--no-default-browser-check'],
+    args: [
+      '--no-first-run',
+      '--no-default-browser-check',
+      // Die Allowlist regelt Navigationen. Chromium telefoniert daneben von
+      // sich aus nach Hause (Autofill-Daten, Komponenten-Updates, Sync,
+      // Domain Reliability) - das hat mit der Absicht des Nutzers nichts zu
+      // tun und wird hier abgeschaltet, damit der Browser nicht hinter dem
+      // Ruecken des Nutzers mit Dritten spricht.
+      '--disable-background-networking',
+      '--disable-component-update',
+      '--disable-domain-reliability',
+      '--disable-sync',
+      '--no-service-autorun',
+    ],
   });
 
   await installAllowlistGuard(context, config.allowedDomains);

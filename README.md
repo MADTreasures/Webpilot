@@ -54,6 +54,13 @@ Versionswechsel ist Pflicht.
 | `*.example.com`   | nur Subdomains, nicht die Apex-Domain               |
 | `*`               | alles (bewusst explizit)                            |
 
+Die Allowlist regelt **Navigationen**. Daneben telefoniert Chromium von sich
+aus nach Hause — Autofill-Daten, Komponenten-Updates, Sync, Domain Reliability.
+Das hat mit der Absicht des Nutzers nichts zu tun, faellt aber auch nicht unter
+"Navigation", weshalb webpilot diese Dienste beim Start abschaltet
+(`--disable-background-networking` und Verwandte). Sonst spricht der Browser mit
+Dritten, obwohl die Allowlist nur localhost enthaelt.
+
 Verglichen wird ausschliesslich der Hostname: **der Port spielt keine Rolle**
 (`localhost` deckt jeden Port ab) und `http` und `https` sind gleichermassen
 erlaubt. Nicht-HTTP(S)-Schemata (`file:`, `data:`, `javascript:`) sind nie
