@@ -432,6 +432,15 @@ schreibt webpilot als erstes Ereignis eine `navigate`-Zeile mit der aktuellen
 URL. Sonst haette der Flow keinen Anfang und `flow_run` wuerde spaeter dort
 starten, wo der Browser gerade zufaellig steht.
 
+**Der Screenshot-Umweg ueber die Platte ist Schutz, kein Feature.** Anforderung
+5 listet `browser_screenshot` ohne Parameter — entsprechend nimmt das Tool den
+sichtbaren Bereich auf und hat keine Optionen. Ueberschreitet das PNG trotzdem
+2 MB (sehr grosses Fenster, sehr dichte Seite), wird es nach `screenshots/`
+geschrieben und nur der Pfad gemeldet: base64-codiert sprengt so ein Bild jedes
+Kontextfenster, und ein Tool, das die Antwort unbrauchbar macht, hilft
+niemandem. Das ist eine Schutzgrenze fuer den Normalfall, keine zusaetzliche
+Faehigkeit.
+
 **Fehler im injizierten Code werden sichtbar gemacht.** Schlaegt ein
 Init-Script in der Seite fehl, meldet weder `addInitScript()` noch `goto()`
 etwas — man merkt es erst am leeren JSONL. webpilot haengt deshalb an jede Seite
