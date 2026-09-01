@@ -9,6 +9,7 @@
 import { createSession } from './browser.js';
 import { loadConfig } from './config.js';
 import { configureLog, createLogger } from './log.js';
+import { replayFlow } from './replay.js';
 
 const log = createLogger('cli');
 
@@ -127,7 +128,31 @@ async function main(): Promise<number> {
       await finish();
       return 0;
     }
-    case 'replay':
+    case 'replay': {
+      const name = args.positional[0];
+      if (!name) {
+        process.stderr.write('replay braucht einen Flow-Namen: webpilot replay <name> --profile <profil>\n');
+        return 1;
+      }
+      const session = await createSession({
+        profile,
+        config,
+        ...(headless === undefined ? {} : { headless }),
+      });
+      try {
+        const timeoutRaw = str(args, 'timeout');
+        const result = await replayFlow(session, config, name, {
+          ...(timeoutRaw ? { timeout: Number(timeoutRaw) } : {}),
+        });
+        process.stderr.write(
+          `Flow "${result.flow}": ${result.executed} ausgefuehrt, ${result.skipped} uebersprungen, ` +
+            `Endstand ${result.finalUrl}\n`,
+        );
+        return 0;
+      } finally {
+        await session.close();
+      }
+    }
     case 'mcp':
       process.stderr.write(`Kommando "${args.command}" ist noch nicht implementiert.\n`);
       return 2;
