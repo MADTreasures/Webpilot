@@ -1,0 +1,7 @@
+{
+  "allowedDomains": ["127.0.0.1"],
+  "profilesDir": "profiles",
+  "flowsDir": "flows",
+  "screenshotsDir": "screenshots",
+  "logBufferSize": 200
+}

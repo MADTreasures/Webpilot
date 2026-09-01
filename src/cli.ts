@@ -9,6 +9,7 @@
 import { createSession } from './browser.js';
 import { loadConfig } from './config.js';
 import { configureLog, createLogger } from './log.js';
+import { runMcpServer } from './mcp.js';
 import { replayFlow } from './replay.js';
 
 const log = createLogger('cli');
@@ -153,9 +154,15 @@ async function main(): Promise<number> {
         await session.close();
       }
     }
-    case 'mcp':
-      process.stderr.write(`Kommando "${args.command}" ist noch nicht implementiert.\n`);
-      return 2;
+    case 'mcp': {
+      // Ab hier gehoert stdout dem JSON-RPC-Protokoll.
+      await runMcpServer({
+        config,
+        profile,
+        ...(headless === undefined ? {} : { headless }),
+      });
+      return 0;
+    }
     case undefined:
     case 'help':
     case '--help':

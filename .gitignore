@@ -11,3 +11,6 @@ logs/
 .DS_Store
 *.log
 .scratch/
+.tmp-test/profiles/
+.tmp-test/flows/
+.tmp-test/screenshots/

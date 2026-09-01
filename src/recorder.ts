@@ -590,6 +590,32 @@ export async function attachRecorder(
       sink = (event) => {
         out.write(`${JSON.stringify(event)}\n`);
       };
+
+      // Startpunkt festhalten: wird die Aufnahme auf einer bereits geoeffneten
+      // Seite gestartet (so laeuft es ueber record_start im MCP-Server), fehlt
+      // dem Flow sonst die erste Navigation - und flow_run beginnt spaeter
+      // irgendwo. Steht der Browser noch auf about:blank, gibt es nichts zu
+      // notieren; die folgende Navigation liefert den Startpunkt dann selbst.
+      const page = context.pages().at(-1);
+      const startUrl = page?.mainFrame().url() ?? '';
+      if (page && startUrl && startUrl !== 'about:blank') {
+        lastNavigation.set(page, startUrl);
+        const start = FlowEventSchema.safeParse({
+          kind: 'navigate',
+          index: index++,
+          id: 'nav:start',
+          ts: new Date().toISOString(),
+          url: startUrl,
+          frame: { path: [], url: startUrl, name: page.mainFrame().name() },
+        });
+        if (start.success) {
+          count++;
+          write(start.data);
+        } else {
+          index--;
+        }
+      }
+
       log.info(`Aufnahme gestartet: ${target}`);
     },
     async stop() {
