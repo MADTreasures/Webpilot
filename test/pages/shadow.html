@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="de">
+<head><meta charset="utf-8"><title>Login in Shadow-DOM</title>
+<style>body{font-family:system-ui,sans-serif;margin:2rem}</style></head>
+<body>
+  <h1>Login in einer Shadow-Root</h1>
+  <shadow-login></shadow-login>
+  <script>
+    // change und submit sind composed:false - sie erreichen einen Listener am
+    // document nicht. Genau dieser Fall wird hier getestet.
+    class ShadowLogin extends HTMLElement {
+      connectedCallback() {
+        const root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = `
+          <form id="shadow-form" method="post" action="/login">
+            <label for="u">Benutzername</label>
+            <input id="u" name="user" type="text" data-testid="shadow-user">
+            <label for="p">Passwort</label>
+            <input id="p" name="password" type="password" autocomplete="current-password">
+            <button type="submit" data-testid="shadow-submit">Anmelden</button>
+          </form>`;
+      }
+    }
+    customElements.define('shadow-login', ShadowLogin);
+  </script>
+</body>
+</html>

@@ -8,6 +8,8 @@
 //   GET  /framed           Login im iframe, dessen src eine wechselnde Nonce traegt
 //   GET  /frame/<nonce>    das eingebettete Login-Formular
 //   GET  /embed?src=...    Seite mit einem iframe auf eine frei waehlbare URL
+//   GET  /redirect?to=...  302 auf eine frei waehlbare URL
+//   GET  /shadow           dasselbe Login-Formular in einer offenen Shadow-Root
 //
 // Zugangsdaten: demo / s3cr3t
 import { createServer } from 'node:http';
@@ -69,6 +71,14 @@ export function createTestServer() {
         return send(res, 200, (await page('framed.html')).replace('__SRC__', `/frame/${nonce}`));
       }
       if (path.startsWith('/frame/')) return send(res, 200, await page('login.html'));
+      if (path === '/shadow') return send(res, 200, await page('shadow.html'));
+      if (path === '/redirect') {
+        // 302 auf eine frei waehlbare URL - prueft die Allowlist gegen Redirects.
+        const to = url.searchParams.get('to') ?? '/';
+        res.writeHead(302, { location: to, 'cache-control': 'no-store' });
+        res.end();
+        return;
+      }
       if (path === '/embed') {
         // Beliebige iframe-src, um die Allowlist gegen Subframes zu pruefen.
         const src = url.searchParams.get('src') ?? '/';

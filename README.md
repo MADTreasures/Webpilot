@@ -57,10 +57,25 @@ Versionswechsel ist Pflicht.
 Nicht-HTTP(S)-Schemata (`file:`, `data:`, `javascript:`) sind nie erlaubt.
 
 **Die Allowlist greift nur auf Navigationen des Hauptframes.** Subframes bleiben
-frei — sonst brechen Logins mit eingebettetem OAuth oder Captcha. Eine
-abgelehnte Navigation wird gar nicht erst ins Netz geschickt (`route.abort`); im
-Browser erscheint `ERR_BLOCKED_BY_CLIENT`, im Log eine Zeile
-`Navigation blockiert: <url>`.
+frei — sonst brechen Logins mit eingebettetem OAuth oder Captcha.
+
+Durchgesetzt wird sie in zwei Schichten:
+
+1. **Vorab im Route-Handler.** Ist die Ziel-URL nicht erlaubt, wird der Request
+   abgebrochen, bevor er das Geraet verlaesst. Im Log steht dann
+   `Navigation blockiert: <url>`, die aktuelle Seite bleibt unveraendert stehen.
+2. **Reissleine auf `framenavigated`.** Committet der Hauptframe trotzdem eine
+   nicht erlaubte URL, wird die Seite sofort verlassen und der Vorgang als
+   `ERROR` protokolliert.
+
+Die zweite Schicht ist noetig, weil Playwright den Route-Handler bei einem
+**Server-Redirect nicht erneut aufruft**: eine erlaubte URL, die per 302 auf
+eine nicht gelistete Domain zeigt, laeuft an Schicht 1 vorbei (nachgemessen,
+Test in `test/e2e.mjs`). Die Grenze ehrlich benannt: in diesem Fall ist der GET
+auf das Redirect-Ziel bereits gelaufen, wenn die Reissleine greift. Der Inhalt
+wird verworfen und nie angezeigt oder bedient, aber die Anfrage hat
+stattgefunden. Wer das ausschliessen muss, gehoert hinter einen echten
+Egress-Proxy — ein Browser-internes Interception-API kann das nicht leisten.
 
 ---
 
@@ -306,6 +321,26 @@ Fallbacks. Beim Abspielen wird daraus eine Kette aus
 komplett egal; der Test deckt genau diesen Fall ab. Die Frame-URL wird nur noch
 zur Diagnose mitgeschrieben.
 
+**Kein isTrusted-Filter auf `input` und `change`.** Klicks und Tastendruecke
+werden weiterhin nur erfasst, wenn sie vom Nutzer kommen — das filtert
+JS-synthetisierte Klicks und den Label-auf-Input-Doppelklick weg. Bei `input`
+und `change` waere derselbe Filter aber schaedlich: Passwortmanager, Autofill
+und React-gesteuerte Felder setzen Werte ueber synthetische Events. Filtert man
+die weg, lernt der Koaleszierer den Feldinhalt nie und der Login wird mit
+leerem Passwortfeld aufgezeichnet. Beide Handler melden fuer sich ohnehin
+nichts — sie merken sich nur den Wert bzw. schreiben ihn heraus; ausgeloest wird
+das Herausschreiben von einer echten Nutzeraktion.
+
+**`change` und `submit` in Shadow-Roots.** Beide Events sind `composed: false`
+und erreichen einen Listener am `document` nicht, wenn sie in einer Shadow-Root
+entstehen — bei Formularen aus Komponentenbibliotheken faellt damit die Haelfte
+der Ereignisse weg. webpilot versorgt deshalb jede Shadow-Root, die ueber
+`composedPath()` eines composed-Events sichtbar wird, mit denselben beiden
+Listenern. Bedarfsgesteuert statt `attachShadow` zu patchen: so werden auch
+deklarative Shadow-Roots (`<template shadowrootmode>`) erfasst. Der CSS-Pfad
+ueberbrueckt Shadow-Grenzen mit einem Descendant-Kombinator, weil Playwrights
+css-Engine offene Shadow-Roots durchdringt.
+
 **Rolle von `input[type=password]`.** Laut ARIA hat ein Passwortfeld keine
 Rolle. Playwright 1.56 bildet es ueber den Default-Zweig seiner Tabelle
 trotzdem auf `textbox` ab — `getByRole('textbox', { name })` greift dort also.
@@ -326,6 +361,12 @@ bereits geoeffneten Seite gestartet — genau so laeuft es ueber das MCP-Tool �
 schreibt webpilot als erstes Ereignis eine `navigate`-Zeile mit der aktuellen
 URL. Sonst haette der Flow keinen Anfang und `flow_run` wuerde spaeter dort
 starten, wo der Browser gerade zufaellig steht.
+
+**Fehler im injizierten Code werden sichtbar gemacht.** Schlaegt ein
+Init-Script in der Seite fehl, meldet weder `addInitScript()` noch `goto()`
+etwas — man merkt es erst am leeren JSONL. webpilot haengt deshalb an jede Seite
+einen `pageerror`-Listener und protokolliert Fehler, die nach Recorder-Code
+aussehen, als `ERROR`.
 
 **Selektor-Kandidaten werden in der Seite verifiziert.** Jeder Kandidat wird vor
 dem Aufschreiben gezaehlt (CSS ueber `querySelectorAll`, Rolle und Text ueber

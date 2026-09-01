@@ -81,11 +81,16 @@ function envHeadless(): boolean | undefined {
 /**
  * Haengt den Allowlist-Guard an den Kontext.
  *
- * Umgesetzt ueber context.route: nur Requests, die eine Navigation des
- * Hauptframes sind, werden geprueft. Alles andere faellt sofort durch
- * (route.fallback fuehrt den Request unveraendert aus, ohne ihn neu zu stellen).
- * Redirects erzeugen jeweils einen neuen Navigations-Request und werden dadurch
- * ebenfalls geprueft.
+ * ERSTE SCHICHT. Geprueft wird ein Request nur, wenn er eine Navigation ist und
+ * keinen Elternframe hat. Alles andere faellt sofort durch (route.fallback
+ * fuehrt den Request unveraendert aus, ohne ihn neu zu stellen). Subframes
+ * bleiben unangetastet, sonst brechen Logins mit eingebettetem OAuth oder
+ * Captcha.
+ *
+ * Diese Schicht allein reicht NICHT: Playwright setzt den Route-Handler bei
+ * einem Server-Redirect nicht erneut an, der Folge-Request laeuft am Handler
+ * vorbei (nachgemessen: 302 von einer erlaubten auf eine nicht gelistete Domain
+ * kommt durch). Deshalb gibt es zusaetzlich installNavigationBackstop().
  */
 export async function installAllowlistGuard(
   context: BrowserContext,
@@ -95,16 +100,56 @@ export async function installAllowlistGuard(
     const request = route.request();
     if (!request.isNavigationRequest()) return route.fallback();
 
-    const frame = request.frame();
-    // Nur der Hauptframe hat keinen Elternframe. Subframes bleiben unangetastet.
-    if (frame.parentFrame() !== null) return route.fallback();
+    // request.frame() wirft bei Popup-Navigationen ("the request was issued
+    // before the frame is created"). Ein solcher Request IST top-level.
+    let isTopLevel = true;
+    try {
+      isTopLevel = request.frame().parentFrame() === null;
+    } catch {
+      isTopLevel = true;
+    }
+    if (!isTopLevel) return route.fallback();
 
     const url = request.url();
     if (isAllowedUrl(url, allowedDomains)) return route.fallback();
 
     log.warn(`Navigation blockiert: ${url}`);
-    await route.abort('blockedbyclient');
+    // 'aborted' statt 'blockedbyclient': letzteres laesst Chromium eine
+    // Fehlerseite committen, die aktuelle Seite geht dabei verloren.
+    await route.abort('aborted');
   });
+}
+
+/**
+ * ZWEITE SCHICHT: Reissleine fuer alles, was am Route-Handler vorbeikommt -
+ * Server-Redirects auf eine nicht gelistete Domain, Popups, exotische Schemata.
+ * Committet der Hauptframe eine nicht erlaubte URL, wird die Seite sofort
+ * verlassen und der Vorgang laut protokolliert.
+ *
+ * Grenze, ehrlich benannt: bei einem Redirect ist der GET auf das Ziel zu
+ * diesem Zeitpunkt bereits gelaufen. Der Inhalt wird verworfen und nie
+ * angezeigt oder bedient, aber die Anfrage hat stattgefunden.
+ */
+export function installNavigationBackstop(
+  context: BrowserContext,
+  allowedDomains: readonly string[],
+): void {
+  const guard = (page: Page): void => {
+    page.on('framenavigated', (frame) => {
+      if (frame !== page.mainFrame()) return;
+      const url = frame.url();
+      if (isAllowedUrl(url, allowedDomains)) return;
+      log.error(
+        `Nicht gelistete Domain erreicht: ${url} (vermutlich ueber einen Redirect). ` +
+          `Die Seite wird sofort verlassen.`,
+      );
+      void page
+        .goto('about:blank', { waitUntil: 'commit' })
+        .catch((err: unknown) => log.warn(`Verlassen der Seite fehlgeschlagen: ${(err as Error).message}`));
+    });
+  };
+  for (const page of context.pages()) guard(page);
+  context.on('page', guard);
 }
 
 export async function createSession(options: SessionOptions): Promise<Session> {
@@ -123,6 +168,7 @@ export async function createSession(options: SessionOptions): Promise<Session> {
   });
 
   await installAllowlistGuard(context, config.allowedDomains);
+  installNavigationBackstop(context, config.allowedDomains);
   // Recorder GENAU EINMAL pro Kontext anhaengen: exposeBinding wirft beim
   // zweiten Aufruf mit demselben Namen.
   const recorder = await attachRecorder(context, config);

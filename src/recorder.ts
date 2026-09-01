@@ -18,7 +18,7 @@ import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
 import type { BrowserContext, Frame, Page } from 'playwright';
 import { z } from 'zod';
-import type { ResolvedConfig } from './config.js';
+import { isAllowedUrl, type ResolvedConfig } from './config.js';
 import { createLogger } from './log.js';
 import {
   ElementInfoSchema,
@@ -108,6 +108,8 @@ export function wprState(): Record<string, unknown> {
       lastValues: new WeakMap<object, string>(),
       /** Gesetzt waehrend der Task, in der Enter verarbeitet wird. */
       enterPending: null as unknown,
+      /** Shadow-Roots, die bereits change/submit-Listener tragen. */
+      shadowRoots: new WeakSet<object>(),
       installed: false,
     };
     w['__webpilotState'] = st;
@@ -228,16 +230,37 @@ export function wprInstall(): void {
 
   const describe = (el: unknown): Record<string, unknown> => wpDescribe(el) as Record<string, unknown>;
 
+  // change und submit sind composed:false - sie erreichen einen Listener am
+  // document NICHT, wenn sie in einer Shadow-Root entstehen. Deshalb bekommt
+  // jede Shadow-Root, die uns ueber composedPath eines composed-Events unter
+  // die Augen kommt, dieselben beiden Listener. Bedarfsgesteuert statt
+  // attachShadow zu patchen: das erwischt auch deklarative Shadow-Roots.
+  const rootsWithListeners = st['shadowRoots'] as WeakSet<object>;
+  const ensureRoot = (root: unknown): void => {
+    const target = root as { addEventListener?: (t: string, l: (e: Event) => void, c: boolean) => void };
+    if (!target || typeof target.addEventListener !== 'function') return;
+    if (rootsWithListeners.has(root as object)) return;
+    rootsWithListeners.add(root as object);
+    target.addEventListener('change', (e: Event) => onChange(e), true);
+    target.addEventListener('submit', (e: Event) => onSubmit(e), true);
+  };
+
   const realTarget = (event: Event): unknown => {
     const path = (event as unknown as { composedPath?: () => unknown[] }).composedPath;
+    let result: unknown = event.target;
     if (typeof path === 'function') {
       const list = path.call(event);
       if (list && list.length > 0) {
         const first = list[0] as { nodeType?: number };
-        if (first && first.nodeType === 1) return first;
+        if (first && first.nodeType === 1) result = first;
+        for (let i = 0; i < list.length; i++) {
+          const node = list[i] as { nodeType?: number; host?: unknown };
+          // DOCUMENT_FRAGMENT_NODE mit host === Shadow-Root
+          if (node && node.nodeType === 11 && node.host) ensureRoot(node);
+        }
       }
     }
-    return event.target;
+    return result;
   };
 
   const closestForm = (el: unknown): unknown => {
@@ -247,10 +270,16 @@ export function wprInstall(): void {
     return null;
   };
 
+  // input und change bewusst OHNE isTrusted-Filter: Passwortmanager,
+  // Autofill und React-gesteuerte Felder setzen Werte per synthetischem
+  // input-Event. Filtert man die weg, lernt der Koaleszierer den Wert nie und
+  // der Login wird mit leerem Feld aufgezeichnet. Beide Handler melden fuer
+  // sich nichts - sie merken sich nur den Feldinhalt bzw. schreiben ihn
+  // heraus; die Filterung gegen JS-synthetisierte Aktionen sitzt dort, wo sie
+  // hingehoert: bei click und keydown.
   document.addEventListener(
     'input',
     (event: Event) => {
-      if (!event.isTrusted) return;
       const target = realTarget(event);
       if (!wprIsFillable(target)) return;
       wprNotePending(target);
@@ -258,10 +287,7 @@ export function wprInstall(): void {
     true,
   );
 
-  document.addEventListener(
-    'change',
-    (event: Event) => {
-      if (!event.isTrusted) return;
+  function onChange(event: Event): void {
       const target = realTarget(event) as { localName?: string; selectedOptions?: ArrayLike<{ value: string }> };
       if (target && target.localName === 'select') {
         const values: string[] = [];
@@ -278,9 +304,8 @@ export function wprInstall(): void {
       if (!wprIsFillable(target)) return;
       wprNotePending(target);
       wprFlushPending(target);
-    },
-    true,
-  );
+  }
+  document.addEventListener('change', onChange, true);
 
   document.addEventListener(
     'focusout',
@@ -349,9 +374,7 @@ export function wprInstall(): void {
     true,
   );
 
-  document.addEventListener(
-    'submit',
-    (event: Event) => {
+  function onSubmit(event: Event): void {
       // submit bewusst OHNE isTrusted-Filter: requestSubmit() aus Seitenskripten
       // erzeugt untrusted submit-Events, die trotzdem zum Ablauf gehoeren.
       const form = event.target;
@@ -381,9 +404,8 @@ export function wprInstall(): void {
       }
       wprFlushPending(null);
       wprEmit({ kind: 'submit', target: describe(form), causedBy: causedBy, causeKind: causeKind });
-    },
-    true,
-  );
+  }
+  document.addEventListener('submit', onSubmit, true);
 
   wprFlush();
 }
@@ -547,11 +569,25 @@ export async function attachRecorder(
   await context.addInitScript({ content: buildInPageSource() });
 
   const attachPage = (page: Page): void => {
+    // addInitScript-Fehler sind still: das Script wirft in der Seite, aber
+    // weder addInitScript noch goto melden etwas. Ohne diesen Listener merkt
+    // man erst am leeren JSONL, dass der Recorder gar nicht laeuft.
+    page.on('pageerror', (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/__webpilot|wpr[A-Z]|wp[A-Z]/.test(message) || /is not defined/.test(message)) {
+        log.error(`Fehler im injizierten Recorder-Code: ${message}`);
+      } else {
+        log.debug(`Seitenfehler: ${message}`);
+      }
+    });
     page.on('framenavigated', (frame) => {
       if (!sink) return;
       if (frame !== page.mainFrame()) return; // Subframe-Navigationen sind Folgen, keine Aktionen.
       const url = frame.url();
       if (!url || url === 'about:blank') return;
+      // Eine geblockte Domain gehoert nicht in den Flow: der Backstop in
+      // browser.ts verlaesst sie ohnehin sofort wieder.
+      if (!isAllowedUrl(url, config.allowedDomains)) return;
       if (lastNavigation.get(page) === url) return;
       lastNavigation.set(page, url);
       const event = FlowEventSchema.safeParse({

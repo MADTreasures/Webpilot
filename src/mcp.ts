@@ -98,7 +98,7 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
       return await action();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (/aria-ref|Timeout|strict mode/i.test(message)) {
+      if (/aria-ref|Timeout|strict mode|Invalid frame|InvalidSelector/i.test(message)) {
         throw new Error(
           `Referenz "${ref}" liess sich nicht aufloesen. Refs gelten nur fuer den zuletzt ` +
             `erstellten Snapshot und werden durch Navigation ungueltig - bitte browser_snapshot ` +

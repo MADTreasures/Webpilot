@@ -65,6 +65,24 @@ try {
     check('In-Page-Navigation auf nicht gelistete Domain wird geblockt',
       !s.page().url().includes(`localhost:${PORT}`), s.page().url());
 
+    // Geblockte Navigation darf die aktuelle Seite nicht zerstoeren.
+    await s.goto(`${origin}/about`);
+    const before = s.page().url();
+    await s.page().evaluate((u) => { location.href = u; }, `http://localhost:${PORT}/about`);
+    await s.page().waitForTimeout(1200);
+    check('geblockte Navigation laesst die aktuelle Seite stehen',
+      s.page().url() === before, `${before} -> ${s.page().url()}`);
+
+    // Server-Redirect von einer erlaubten auf eine nicht gelistete Domain:
+    // der Route-Handler sieht den Folge-Request nicht, der Backstop schon.
+    await s.goto(`${origin}/`);
+    await s.page()
+      .goto(`${origin}/redirect?to=${encodeURIComponent(`http://localhost:${PORT}/about`)}`, { waitUntil: 'domcontentloaded' })
+      .catch(() => undefined);
+    await s.page().waitForTimeout(2000);
+    check('Redirect auf eine nicht gelistete Domain wird nicht gehalten',
+      !s.page().url().startsWith(`http://localhost:${PORT}`), s.page().url());
+
     await s.goto(`${origin}/embed?src=${encodeURIComponent(`http://localhost:${PORT}/about`)}`);
     await s.page().waitForTimeout(1200);
     const subText = await s.page().frameLocator('#embedded').locator('h1').textContent().catch((e) => `ERR ${e}`);
@@ -154,6 +172,46 @@ try {
       lines.some((e) => e.kind === 'click' && e.causeKind === 'implicit-submit' && e.causedBy === press?.id));
     check('kein doppeltes fill fuer dasselbe Feld',
       lines.filter((e) => e.kind === 'fill' && e.target?.isPassword).length === 1);
+  }
+
+  section('Recorder: Formular in einer offenen Shadow-Root');
+  {
+    const s = await open('recshadow');
+    await s.recorder.start('login-shadow');
+    await s.goto(`${origin}/shadow`);
+    const p = s.page();
+    // change und submit sind composed:false und erreichen document nicht -
+    // der Recorder muss die Shadow-Root selbst mit Listenern versorgen.
+    await p.locator('shadow-login #u').click();
+    await p.keyboard.type('demo', { delay: 10 });
+    await p.locator('shadow-login #p').click();
+    await p.keyboard.type('s3cr3t', { delay: 10 });
+    await p.locator('shadow-login [data-testid="shadow-submit"]').click();
+    await p.waitForURL('**/welcome*', { timeout: 15000 });
+    await p.waitForTimeout(400);
+    const res = await s.recorder.stop();
+    await s.close();
+
+    const lines = readFileSync(res.path, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    check('Eingaben in der Shadow-Root werden erfasst',
+      lines.filter((e) => e.kind === 'fill').length === 2, String(lines.filter((e) => e.kind === 'fill').length));
+    check('Passwort in der Shadow-Root ist maskiert',
+      lines.some((e) => e.kind === 'fill' && e.value === '{{secret:password}}') && !JSON.stringify(lines).includes('s3cr3t'));
+    check('submit aus der Shadow-Root wird trotz composed:false erfasst',
+      lines.some((e) => e.kind === 'submit' && e.causeKind === 'submitter'),
+      JSON.stringify(lines.filter((e) => e.kind === 'submit').map((e) => e.causeKind)));
+    check('Selektor durchdringt die Shadow-Grenze',
+      lines.some((e) => e.target?.selectors && JSON.stringify(e.target.selectors).includes('shadow-login')) ||
+        lines.some((e) => e.target?.selectors.primary.kind === 'testid'),
+      JSON.stringify(lines.find((e) => e.kind === 'fill')?.target.selectors));
+  }
+
+  {
+    const s = await open('playshadow');
+    await replayFlow(s, config, 'login-shadow', { env: { WEBPILOT_SECRET_PASSWORD: 's3cr3t' } });
+    const who = await s.page().locator('[data-testid="who"]').textContent().catch(() => null);
+    await s.close();
+    check('Shadow-DOM-Login laesst sich wiederholen', who === 'demo', String(who));
   }
 
   /* ================= Replay ================= */
