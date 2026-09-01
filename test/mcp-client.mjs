@@ -22,12 +22,15 @@ const check = (name, ok, extra = '') => {
 const textOf = (res) => (res.content ?? []).filter((c) => c.type === 'text').map((c) => c.text).join('\n');
 
 const { server: httpServer, origin } = await startTestServer(PORT);
-rmSync(resolve(ROOT, 'profiles/mcptest'), { recursive: true, force: true });
-rmSync(resolve(ROOT, 'flows/mcp-login.jsonl'), { force: true });
+const TMP = resolve(ROOT, '.tmp-test');
+rmSync(resolve(TMP, 'profiles/mcptest'), { recursive: true, force: true });
+rmSync(resolve(TMP, 'flows/mcp-login.jsonl'), { force: true });
 
 const transport = new StdioClientTransport({
   command: process.execPath,
-  args: ['dist/cli.js', 'mcp', '--profile', 'mcptest'],
+  // Eigene Konfiguration: profiles/, flows/ und screenshots/ des Projekts
+  // bleiben unberuehrt, die Allowlist deckt genau die Testseite ab.
+  args: ['dist/cli.js', 'mcp', '--profile', 'mcptest', '--config', '.tmp-test/config.json'],
   cwd: ROOT,
   stderr: 'pipe',
   env: {
@@ -127,7 +130,7 @@ try {
   const stopped = await client.callTool({ name: 'record_stop', arguments: {} });
   check('record_stop schreibt den Flow', !stopped.isError && textOf(stopped).includes('mcp-login.jsonl'), textOf(stopped));
 
-  const flowLines = readFileSync(resolve(ROOT, 'flows/mcp-login.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const flowLines = readFileSync(resolve(TMP, 'flows/mcp-login.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
   check('auf offener Seite gestartete Aufnahme haelt den Startpunkt fest',
     flowLines[0]?.kind === 'navigate' && flowLines[0].url === `${origin}/`, JSON.stringify(flowLines[0]?.kind));
   check('Passwort steht auch im MCP-Mitschnitt nicht im Klartext',
