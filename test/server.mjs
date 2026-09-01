@@ -7,6 +7,7 @@
 //   GET  /about            statische Nebenseite
 //   GET  /framed           Login im iframe, dessen src eine wechselnde Nonce traegt
 //   GET  /frame/<nonce>    das eingebettete Login-Formular
+//   GET  /embed?src=...    Seite mit einem iframe auf eine frei waehlbare URL
 //
 // Zugangsdaten: demo / s3cr3t
 import { createServer } from 'node:http';
@@ -68,6 +69,17 @@ export function createTestServer() {
         return send(res, 200, (await page('framed.html')).replace('__SRC__', `/frame/${nonce}`));
       }
       if (path.startsWith('/frame/')) return send(res, 200, await page('login.html'));
+      if (path === '/embed') {
+        // Beliebige iframe-src, um die Allowlist gegen Subframes zu pruefen.
+        const src = url.searchParams.get('src') ?? '/';
+        return send(
+          res,
+          200,
+          `<!doctype html><html lang="de"><head><meta charset="utf-8"><title>Embed</title></head>` +
+            `<body><h1 id="embed-heading">Embed</h1>` +
+            `<iframe id="embedded" title="Eingebettet" src="${escapeHtml(src)}"></iframe></body></html>`,
+        );
+      }
 
       return send(res, 404, '<h1>404</h1>');
     } catch (err) {
