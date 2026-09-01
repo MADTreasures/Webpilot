@@ -119,6 +119,25 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
 
   let session: Session | null = null;
 
+  /**
+   * Snapshot-Referenzen sind NUR innerhalb eines Snapshots stabil. Bei einem
+   * neuen Dokument beginnt Playwright die Nummerierung wieder bei e1 - ein
+   * altes e11 zeigt danach nicht ins Leere, sondern moeglicherweise auf ein
+   * ganz anderes Element. Deshalb wird pro Seite mitgezaehlt, wie oft der
+   * Hauptframe navigiert ist, und beim Zugriff mit dem Stand zum
+   * Snapshot-Zeitpunkt verglichen.
+   */
+  const navCount = new WeakMap<Page, number>();
+  let lastSnapshot: { page: Page; nav: number } | null = null;
+
+  const watchNavigations = (page: Page): void => {
+    navCount.set(page, navCount.get(page) ?? 0);
+    page.on('framenavigated', (frame) => {
+      if (frame !== page.mainFrame()) return;
+      navCount.set(page, (navCount.get(page) ?? 0) + 1);
+    });
+  };
+
   const requireSession = (): Session => {
     if (!session) {
       throw new Error('Es ist kein Browser offen. Zuerst browser_open aufrufen.');
@@ -147,6 +166,8 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
       created.context.on('close', () => {
         if (session === created) session = null;
       });
+      for (const page of created.context.pages()) watchNavigations(page);
+      created.context.on('page', watchNavigations);
       session = created;
     }
     return session;
@@ -156,6 +177,16 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
     if (!REF_PATTERN.test(ref)) {
       throw new Error(
         `"${ref}" ist keine gueltige Referenz. Refs stammen aus browser_snapshot und sehen aus wie e12 oder f1e3.`,
+      );
+    }
+    if (!lastSnapshot) {
+      throw new Error('Es gibt noch keinen Snapshot. Zuerst browser_snapshot aufrufen.');
+    }
+    if (lastSnapshot.page !== page || (navCount.get(page) ?? 0) !== lastSnapshot.nav) {
+      throw new Error(
+        `Die Seite hat seit dem letzten browser_snapshot navigiert. Referenzen werden pro Dokument ` +
+          `neu vergeben, "${ref}" wuerde jetzt auf ein anderes Element zeigen - bitte browser_snapshot ` +
+          `erneut aufrufen und mit den neuen Referenzen arbeiten.`,
       );
     }
     return page.locator(`aria-ref=${ref}`);
@@ -235,9 +266,10 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
     {
       title: 'ARIA-Snapshot',
       description:
-        'Liefert einen ARIA-Snapshot der aktuellen Seite mit stabilen Referenzen ([ref=e12]). ' +
-        'Diese Referenzen sind die Eingabe fuer browser_click und browser_type und werden durch ' +
-        'Navigation ungueltig.',
+        'Liefert einen ARIA-Snapshot der aktuellen Seite mit Referenzen ([ref=e12]). ' +
+        'Diese Referenzen sind die Eingabe fuer browser_click und browser_type. Sie gelten genau ' +
+        'fuer diesen Snapshot: nach jeder Navigation vergibt der Browser neue Nummern, deshalb ' +
+        'danach erneut aufrufen.',
       inputSchema: {},
     },
     async () =>
@@ -256,6 +288,7 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
         const secrets = await collectSecretValues(page);
         const safe = redactSecrets(snapshot, secrets);
         if (secrets.length > 0) log.info(`${secrets.length} Passwortwert(e) im Snapshot geschwaerzt.`);
+        lastSnapshot = { page, nav: navCount.get(page) ?? 0 };
         return text(`URL: ${page.url()}\nTitel: ${await page.title()}\n\n${safe}`);
       }),
   );

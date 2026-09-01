@@ -126,6 +126,8 @@ try {
   const staleRef = await client.callTool({ name: 'browser_click', arguments: { ref: btnRef } });
   check('ref nach Navigation -> Tool-Error mit Hinweis auf neuen Snapshot',
     staleRef.isError === true && textOf(staleRef).includes('browser_snapshot'), textOf(staleRef).split('\n')[0]);
+  check('der Fehler nennt den Grund (Referenzen werden pro Dokument neu vergeben)',
+    textOf(staleRef).includes('navigiert'), textOf(staleRef).slice(0, 90));
 
   const stopped = await client.callTool({ name: 'record_stop', arguments: {} });
   check('record_stop schreibt den Flow', !stopped.isError && textOf(stopped).includes('mcp-login.jsonl'), textOf(stopped));

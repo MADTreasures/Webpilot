@@ -147,13 +147,16 @@ Browser nie — auch nicht in einen Zwischenpuffer. Im JSONL steht:
 {"kind":"fill","value":"{{secret:password}}","secret":true, ...}
 ```
 
-Beim Abspielen wird `{{secret:<feld>}}` in dieser Reihenfolge gesucht:
+Beim Abspielen wird `{{secret:<feld>}}` aus `WEBPILOT_SECRET_<FELD>` aufgeloest
+(Grossbuchstaben, alles Nicht-Alphanumerische zu `_`). Also:
+`{{secret:password}}` → `WEBPILOT_SECRET_PASSWORD`.
 
-1. `WEBPILOT_SECRET_<FELD>` (Grossbuchstaben, alles Nicht-Alphanumerische zu `_`)
-2. `<FELD>`
+Der Praefix ist Absicht und nicht optional: ein Rueckfall auf den blanken
+Feldnamen waere bequem, wuerde aber bei einem Feld namens `path`, `home` oder
+`user` den Inhalt von `$PATH`, `$HOME` oder `$USER` in ein Webformular tippen.
 
-Fehlt der Wert, bricht der Replay ab. Der Platzhalter wird niemals als Text in
-ein Formular getippt.
+Fehlt der Wert, bricht der Replay ab und nennt die erwartete Variable. Der
+Platzhalter wird niemals als Text in ein Formular getippt.
 
 ### Flow-Format
 
@@ -219,8 +222,12 @@ Der Server spricht JSON-RPC ueber **stdout**; jede Logzeile geht auf **stderr**.
 Alle Eingaben sind mit zod validiert. Fehler kommen als **Tool-Error**
 (`isError: true`) zurueck, nicht als Protokollfehler.
 
-Referenzen aus `browser_snapshot` gelten nur fuer den zuletzt erstellten
-Snapshot und werden durch Navigation ungueltig; das Tool sagt das dann auch so.
+Referenzen aus `browser_snapshot` gelten genau fuer diesen einen Snapshot. Bei
+einem neuen Dokument beginnt Playwright die Nummerierung wieder bei `e1` — ein
+altes `e11` zeigt danach nicht ins Leere, sondern womoeglich auf ein voellig
+anderes Element. webpilot zaehlt deshalb pro Seite die Navigationen mit und
+lehnt `browser_click` und `browser_type` mit einer klaren Meldung ab, sobald
+sich der Stand seit dem Snapshot geaendert hat.
 
 Ein paar Eigenschaften, die man kennen sollte:
 

@@ -111,14 +111,21 @@ export function readFlow(config: ResolvedConfig, name: string): FlowEvent[] {
  * Secrets
  * ------------------------------------------------------------------ */
 
-/** {{secret:passwort}} -> WEBPILOT_SECRET_PASSWORT (oder PASSWORT). */
+/**
+ * {{secret:passwort}} -> WEBPILOT_SECRET_PASSWORT.
+ *
+ * Bewusst NUR mit Praefix. Ein Rueckfall auf den blanken Namen waere bequem,
+ * wuerde aber bei einem Feld namens "path", "home" oder "user" den Inhalt von
+ * $PATH, $HOME oder $USER in ein Webformular tippen. Ein expliziter Namensraum
+ * schliesst diese ganze Fehlerklasse aus.
+ */
 export function secretEnvNames(fieldName: string): string[] {
   const normalized = fieldName
     .trim()
     .replace(/[^A-Za-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '')
     .toUpperCase();
-  return [`WEBPILOT_SECRET_${normalized}`, normalized];
+  return [`WEBPILOT_SECRET_${normalized}`];
 }
 
 /**
