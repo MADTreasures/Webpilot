@@ -27,7 +27,11 @@ import { z } from 'zod';
 export const SelectorSpecSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('testid'), value: z.string() }),
   z.object({ kind: z.literal('id'), value: z.string() }),
-  z.object({ kind: z.literal('role'), role: z.string(), name: z.string(), exact: z.boolean().default(false) }),
+  // exact ist immer true. getByRole(..., { exact: false }) ist ein
+  // Gross-/Kleinschreibung ignorierender TEILSTRING-Vergleich ("Anmelden"
+  // trifft auch "Anmelden jetzt"), damit waere jede Eindeutigkeitspruefung
+  // bei der Aufnahme wertlos. Aeltere Flows mit false bleiben lesbar.
+  z.object({ kind: z.literal('role'), role: z.string(), name: z.string(), exact: z.boolean().default(true) }),
   z.object({ kind: z.literal('text'), value: z.string(), tag: z.string().nullable().default(null) }),
   z.object({ kind: z.literal('css'), value: z.string() }),
 ]);
@@ -38,7 +42,12 @@ export const SelectorSetSchema = z.object({
   primary: SelectorSpecSchema,
   /** Genau die zwei naechstbesten Selektoren aus moeglichst anderen Strategien. */
   fallbacks: z.array(SelectorSpecSchema).max(4).default([]),
-  /** Diagnose: war der Selektor bei der Aufnahme im Dokument eindeutig? */
+  /**
+   * War der Selektor bei der Aufnahme nachweislich eindeutig? false heisst
+   * entweder "mehrdeutig" oder "nicht pruefbar" (Elemente in einer Shadow-Root:
+   * Playwrights css-Engine durchdringt offene Shadow-Roots, querySelectorAll
+   * nicht - eine Zaehlung in der Seite waere schlicht falsch).
+   */
   unique: z.boolean().default(true),
 });
 export type SelectorSet = z.infer<typeof SelectorSetSchema>;
@@ -88,19 +97,6 @@ export function wpIsStableId(id: unknown): boolean {
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(v)) return false;
   if (/^(ember|react-aria|radix-|mui-|headlessui-|:r)/i.test(v)) return false;
   return /^[A-Za-z_][A-Za-z0-9_:.-]*$/.test(v);
-}
-
-export function wpIsVisible(el: unknown): boolean {
-  const node = el as { getClientRects?: () => { length: number } };
-  if (!node || typeof node.getClientRects !== 'function') return false;
-  if (node.getClientRects().length === 0) return false;
-  const view = (el as { ownerDocument?: { defaultView?: unknown } }).ownerDocument?.defaultView as
-    | { getComputedStyle?: (e: unknown) => { visibility: string } }
-    | undefined;
-  if (view && typeof view.getComputedStyle === 'function') {
-    if (view.getComputedStyle(el).visibility === 'hidden') return false;
-  }
-  return true;
 }
 
 /**
@@ -213,10 +209,17 @@ export function wpAccName(el: unknown): string {
         if (v) return v;
       }
     }
+    // Reihenfolge wie in Playwrights accname: title schlaegt placeholder, und
+    // placeholder zaehlt nur bei textartigen input-Typen bzw. textarea.
     const title = wpNorm(e.getAttribute('title'), 200);
     if (title) return title;
-    const placeholder = wpNorm(e.getAttribute('placeholder'), 200);
-    if (placeholder) return placeholder;
+    const type = (e.getAttribute('type') || 'text').toLowerCase();
+    const placeholderTypes = ['text', 'password', 'search', 'tel', 'email', 'url'];
+    const usePlaceholder = tag === 'textarea' || (tag === 'input' && placeholderTypes.indexOf(type) !== -1);
+    if (usePlaceholder) {
+      const placeholder = wpNorm(e.getAttribute('placeholder'), 200);
+      if (placeholder) return placeholder;
+    }
     return '';
   }
 
@@ -232,9 +235,11 @@ export function wpAccName(el: unknown): string {
 
 /** Ein Pfadsegment: Tagname plus :nth-of-type, falls noetig. */
 export function wpCssSegment(el: unknown): string {
-  const e = el as { localName: string; parentElement: unknown };
+  const e = el as { localName: string; parentElement: unknown; parentNode: unknown };
   const tag = e.localName;
-  const parent = e.parentElement as { children?: ArrayLike<{ localName: string }> } | null;
+  // Beim obersten Kind einer Shadow-Root ist parentElement null, die
+  // Geschwister stehen aber unter parentNode (der Shadow-Root selbst).
+  const parent = (e.parentElement ?? e.parentNode) as { children?: ArrayLike<{ localName: string }> } | null;
   if (!parent || !parent.children) return tag;
   let index = 0;
   let total = 0;
@@ -332,15 +337,30 @@ export function wpAttrCss(el: unknown): string | null {
   return self;
 }
 
-/** Zaehlt Treffer eines CSS-Selektors in der Wurzel des Elements. */
-export function wpCountCss(el: unknown, selector: string): number {
+/** Liegt das Element in einer Shadow-Root? Dann ist in-page nichts zaehlbar. */
+export function wpInShadow(el: unknown): boolean {
+  const e = el as { getRootNode?: () => { host?: unknown } };
+  const root = e.getRootNode ? e.getRootNode() : null;
+  return !!(root && root.host);
+}
+
+/**
+ * Verifiziert einen CSS-Selektor: 1 = trifft genau dieses Element,
+ * 0 = mehrdeutig oder trifft ein anderes, -1 = nicht pruefbar.
+ *
+ * Ein Treffer allein genuegt nicht - der Treffer muss AUCH das Zielelement
+ * sein. Ein eindeutiger Selektor, der auf ein fremdes Element zeigt, ist
+ * schlimmer als gar keiner.
+ */
+export function wpVerifyCss(el: unknown, selector: string): number {
+  if (wpInShadow(el)) return -1;
   const e = el as { getRootNode?: () => { querySelectorAll?: (s: string) => ArrayLike<unknown> } };
   const root = e.getRootNode ? e.getRootNode() : null;
-  const scope = root && root.querySelectorAll ? root : null;
-  if (!scope || !scope.querySelectorAll) return -1;
+  if (!root || !root.querySelectorAll) return -1;
   try {
-    const found = scope.querySelectorAll(selector);
-    return found.length;
+    const found = root.querySelectorAll(selector);
+    if (found.length !== 1) return 0;
+    return found[0] === el ? 1 : 0;
   } catch {
     return -1;
   }
@@ -359,39 +379,48 @@ export function wpAllElements(el: unknown): unknown[] {
 }
 
 /**
- * Zaehlt Elemente mit gleicher Rolle und gleichem Accessible Name.
- * Playwright vergleicht den Namen bei exact=false ohne Beruecksichtigung von
- * Gross-/Kleinschreibung ueber den ganzen String - genau so wird hier gezaehlt.
+ * Verifiziert Rolle + Accessible Name. Verglichen wird exakt und
+ * Gross-/Kleinschreibung beachtend - genau so, wie getByRole mit exact:true
+ * vergleicht. (Mit exact:false waere es ein Teilstring-Vergleich und die
+ * Zaehlung damit wertlos.)
  */
-export function wpCountRole(el: unknown, role: string, name: string): number {
+export function wpVerifyRole(el: unknown, role: string, name: string): number {
+  if (wpInShadow(el)) return -1;
   const list = wpAllElements(el);
   if (list.length === 0) return -1;
-  const needle = name.toLowerCase();
   let count = 0;
+  let hit = false;
   for (let i = 0; i < list.length; i++) {
     const candidate = list[i];
     if (wpRole(candidate) !== role) continue;
-    if (wpAccName(candidate).toLowerCase() !== needle) continue;
+    if (wpAccName(candidate) !== name) continue;
     count++;
-    if (count > 1) return count;
+    if (candidate === el) hit = true;
+    if (count > 1) return 0;
   }
-  return count;
+  return count === 1 && hit ? 1 : 0;
 }
 
-/** Zaehlt sichtbare Elemente, deren normalisierter Text exakt uebereinstimmt. */
-export function wpCountText(el: unknown, text: string, tag: string | null): number {
+/**
+ * Verifiziert einen Textselektor. Ohne Sichtbarkeitsfilter, weil der beim
+ * Replay eingesetzte locator(tag).filter({hasText}) ebenfalls keinen hat -
+ * die Zaehlung soll das abbilden, was spaeter wirklich passiert.
+ */
+export function wpVerifyText(el: unknown, text: string, tag: string | null): number {
+  if (wpInShadow(el)) return -1;
   const list = wpAllElements(el);
   if (list.length === 0) return -1;
   let count = 0;
+  let hit = false;
   for (let i = 0; i < list.length; i++) {
     const candidate = list[i] as { localName: string; textContent: string | null };
     if (tag && candidate.localName !== tag) continue;
     if (wpNorm(candidate.textContent, 400) !== text) continue;
-    if (!wpIsVisible(candidate)) continue;
     count++;
-    if (count > 1) return count;
+    if (candidate === el) hit = true;
+    if (count > 1) return 0;
   }
-  return count;
+  return count === 1 && hit ? 1 : 0;
 }
 
 /** Feldname fuer {{secret:<name>}} und fuer die Diagnose. */
@@ -419,77 +448,80 @@ export function wpIsPassword(el: unknown): boolean {
 
 /**
  * Baut die Kandidatenliste in der geforderten Prioritaet und verifiziert jede
- * Variante direkt im Dokument auf Eindeutigkeit.
+ * Variante direkt im Dokument.
+ *
+ * `verify`: 1 = trifft genau dieses Element, 0 = mehrdeutig oder danebengezielt,
+ * -1 = nicht pruefbar (Shadow-Root).
  */
-export function wpCandidates(el: unknown): Array<{ spec: unknown; unique: boolean; family: string }> {
+export function wpCandidates(el: unknown): Array<{ spec: unknown; verify: number; family: string }> {
   const e = el as { localName: string; getAttribute: (n: string) => string | null; id?: string; textContent: string | null };
-  const out: Array<{ spec: unknown; unique: boolean; family: string }> = [];
-  const push = (spec: unknown, unique: boolean, family: string) => {
-    out.push({ spec: spec, unique: unique, family: family });
+  const out: Array<{ spec: unknown; verify: number; family: string }> = [];
+  const push = (spec: unknown, verify: number, family: string) => {
+    out.push({ spec: spec, verify: verify, family: family });
   };
 
   // 1. data-testid
   const testid = e.getAttribute('data-testid');
   if (testid && wpNorm(testid, 200)) {
-    const count = wpCountCss(el, '[data-testid=' + wpQuoteAttr(testid) + ']');
-    push({ kind: 'testid', value: testid }, count === 1, 'testid');
+    push({ kind: 'testid', value: testid }, wpVerifyCss(el, '[data-testid=' + wpQuoteAttr(testid) + ']'), 'testid');
   }
 
   // 2. id
   if (wpIsStableId(e.id)) {
     const id = String(e.id);
-    const count = wpCountCss(el, '[id=' + wpQuoteAttr(id) + ']');
-    push({ kind: 'id', value: id }, count === 1, 'id');
+    push({ kind: 'id', value: id }, wpVerifyCss(el, '[id=' + wpQuoteAttr(id) + ']'), 'id');
   }
 
   // 3. Rolle + Accessible Name
   const role = wpRole(el);
   const accName = wpAccName(el);
   if (role && accName) {
-    const count = wpCountRole(el, role, accName);
-    push({ kind: 'role', role: role, name: accName, exact: false }, count === 1, 'role');
+    push({ kind: 'role', role: role, name: accName, exact: true }, wpVerifyRole(el, role, accName), 'role');
   }
 
-  // 4. Sichtbarer Text (nur fuer Elemente, die ihren Namen aus dem Text ziehen)
+  // 4. Sichtbarer Text - nur fuer Elemente, die ihren Namen aus dem Text ziehen
   const ownText = wpNorm(e.textContent, 120);
   if (ownText && ownText.length <= 80 && e.localName !== 'input' && e.localName !== 'textarea') {
-    const count = wpCountText(el, ownText, e.localName);
-    push({ kind: 'text', value: ownText, tag: e.localName }, count === 1, 'text');
+    push({ kind: 'text', value: ownText, tag: e.localName }, wpVerifyText(el, ownText, e.localName), 'text');
   }
 
   // 5. CSS - drei bewusst unterschiedliche Varianten
   const attrCss = wpAttrCss(el);
-  if (attrCss) push({ kind: 'css', value: attrCss }, wpCountCss(el, attrCss) === 1, 'css-attr');
+  if (attrCss) push({ kind: 'css', value: attrCss }, wpVerifyCss(el, attrCss), 'css-attr');
 
   const anchored = wpCssPath(el, true);
-  if (anchored) push({ kind: 'css', value: anchored }, wpCountCss(el, anchored) === 1, 'css-anchored');
+  if (anchored) push({ kind: 'css', value: anchored }, wpVerifyCss(el, anchored), 'css-anchored');
 
   const full = wpCssPath(el, false);
-  if (full && full !== anchored) push({ kind: 'css', value: full }, wpCountCss(el, full) === 1, 'css-full');
+  if (full && full !== anchored) push({ kind: 'css', value: full }, wpVerifyCss(el, full), 'css-full');
 
   return out;
 }
 
 /**
- * Waehlt Primaerselektor und zwei Fallbacks. Bevorzugt werden eindeutige
- * Kandidaten; unter diesen wird die Prioritaetsreihenfolge eingehalten und
- * darauf geachtet, dass die Fallbacks aus anderen Strategie-Familien stammen.
+ * Waehlt Primaerselektor und zwei Fallbacks.
+ *
+ * Sortiert wird in drei Stufen - nachweislich eindeutig, nicht pruefbar,
+ * nachweislich mehrdeutig - und innerhalb einer Stufe bleibt die geforderte
+ * Prioritaet erhalten. Danach wird je Strategie-Familie hoechstens ein
+ * Kandidat genommen: zwei Fallbacks derselben Familie waeren im Fehlerfall
+ * genauso kaputt wie der Primaerselektor.
  */
 export function wpDescribe(el: unknown): unknown {
   const e = el as { localName: string; getAttribute: (n: string) => string | null; textContent: string | null };
   const candidates = wpCandidates(el);
-  const unique: Array<{ spec: unknown; unique: boolean; family: string }> = [];
-  const rest: Array<{ spec: unknown; unique: boolean; family: string }> = [];
+  const tiers: Array<Array<{ spec: unknown; verify: number; family: string }>> = [[], [], []];
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i];
     if (!c) continue;
-    if (c.unique) unique.push(c);
-    else rest.push(c);
+    const tier = c.verify === 1 ? 0 : c.verify === -1 ? 1 : 2;
+    const bucket = tiers[tier];
+    if (bucket) bucket.push(c);
   }
-  const ordered = unique.concat(rest);
-  const chosen: Array<{ spec: unknown; unique: boolean; family: string }> = [];
+  const ordered = (tiers[0] ?? []).concat(tiers[1] ?? [], tiers[2] ?? []);
+
+  const chosen: Array<{ spec: unknown; verify: number; family: string }> = [];
   const usedFamilies: string[] = [];
-  // Erst je Familie den besten Kandidaten, dann auffuellen.
   for (let i = 0; i < ordered.length && chosen.length < 3; i++) {
     const c = ordered[i];
     if (!c) continue;
@@ -516,7 +548,7 @@ export function wpDescribe(el: unknown): unknown {
     selectors: {
       primary: primary ? primary.spec : { kind: 'css', value: wpCssPath(el, false) || e.localName },
       fallbacks: fallbacks,
-      unique: primary ? primary.unique : false,
+      unique: primary ? primary.verify === 1 : false,
     },
     tag: e.localName,
     role: wpRole(el),
@@ -539,16 +571,16 @@ export const SELECTOR_INPAGE_FUNCTIONS = [
   wpCssEscape,
   wpQuoteAttr,
   wpIsStableId,
-  wpIsVisible,
   wpRole,
   wpAccName,
   wpCssSegment,
   wpCssPath,
   wpAttrCss,
-  wpCountCss,
+  wpInShadow,
+  wpVerifyCss,
   wpAllElements,
-  wpCountRole,
-  wpCountText,
+  wpVerifyRole,
+  wpVerifyText,
   wpFieldName,
   wpIsPassword,
   wpCandidates,

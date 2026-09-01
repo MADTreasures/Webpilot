@@ -8,7 +8,7 @@
  *    zurueck (content + isError), nicht als Protokollfehler: der SDK wandelt
  *    eine im Callback geworfene Exception genau dazu um.
  */
-import { readdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -33,6 +33,74 @@ type PageWithSnapshotForAI = Page & {
 };
 
 export const REF_PATTERN = /^(f\d+)*e\d+$/;
+
+/** Ab dieser Groesse wird ein Screenshot nicht mehr ins Ergebnis eingebettet. */
+export const MAX_SCREENSHOT_BYTES = 2_000_000;
+
+export interface SecretValue {
+  field: string;
+  /** Nur zum Schwaerzen. Dieser Wert wird nie geloggt und nie zurueckgegeben. */
+  value: string;
+}
+
+/**
+ * Werte aller Passwortfelder einsammeln - ueber alle Frames.
+ *
+ * Klingt paradox, ist aber genau der Punkt: der ARIA-Snapshot enthaelt den
+ * Feldinhalt im KLARTEXT (`textbox "Passwort" [ref=e4]: hunter2`). Ohne diesen
+ * Schritt waere jeder browser_snapshot auf einer Seite mit ausgefuelltem oder
+ * automatisch gefuelltem Loginformular ein Passwort-Leak ins Transkript.
+ * Die Werte bleiben im Prozess und dienen nur dem Schwaerzen.
+ */
+export async function collectSecretValues(page: Page): Promise<SecretValue[]> {
+  const out: SecretValue[] = [];
+  for (const frame of page.frames()) {
+    try {
+      const found = await frame.evaluate(() => {
+        const list: Array<{ field: string; value: string }> = [];
+        const inputs = document.querySelectorAll('input');
+        for (let i = 0; i < inputs.length; i++) {
+          const el = inputs[i] as HTMLInputElement | undefined;
+          if (!el) continue;
+          const type = (el.getAttribute('type') ?? '').toLowerCase();
+          const autocomplete = (el.getAttribute('autocomplete') ?? '').toLowerCase();
+          const isSecret =
+            type === 'password' || autocomplete === 'current-password' || autocomplete === 'new-password';
+          if (!isSecret || !el.value) continue;
+          list.push({ field: el.getAttribute('name') || el.id || 'passwort', value: el.value });
+        }
+        return list;
+      });
+      out.push(...found);
+    } catch {
+      // Frame abgeloest oder nicht erreichbar - dann gibt es dort auch nichts zu schwaerzen.
+    }
+  }
+  return out;
+}
+
+/**
+ * Ersetzt Passwortwerte im Snapshot durch {{secret:<feld>}}.
+ *
+ * Zuerst praezise am Zeilenende (dort steht der Feldwert im Snapshot), danach
+ * global, falls die Seite den Wert an anderer Stelle wiederholt. Bei sehr
+ * kurzen Passwoertern schwaerzt der zweite Schritt mehr als noetig - das ist
+ * die richtige Richtung, in die ein solcher Filter irren darf.
+ */
+export function redactSecrets(snapshot: string, secrets: readonly SecretValue[]): string {
+  let result = snapshot;
+  for (const secret of secrets) {
+    if (!secret.value) continue;
+    const placeholder = `{{secret:${secret.field}}}`;
+    const suffix = `: ${secret.value}`;
+    result = result
+      .split('\n')
+      .map((line) => (line.endsWith(suffix) ? `${line.slice(0, line.length - secret.value.length)}${placeholder}` : line))
+      .join('\n');
+    result = result.split(secret.value).join(placeholder);
+  }
+  return result;
+}
 
 export interface McpOptions {
   config?: ResolvedConfig;
@@ -111,6 +179,23 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
 
   const text = (value: string) => ({ content: [{ type: 'text' as const, text: value }] });
 
+  /**
+   * Tool-Aufrufe werden vom SDK NICHT serialisiert - zwei Aufrufe koennen sich
+   * ueberlappen. Auf einer geteilten Seite ist das schaedlich: ein
+   * browser_click, der navigiert, entwertet genau die Referenzen, die ein
+   * parallel laufender browser_snapshot gerade herausgibt. Alles, was den
+   * Browser anfasst, laeuft deshalb durch diese Schlange.
+   */
+  let lock: Promise<unknown> = Promise.resolve();
+  const exclusive = <T>(task: () => Promise<T>): Promise<T> => {
+    const run = lock.then(task, task);
+    lock = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+
   const server = new McpServer({ name: 'webpilot', version: '0.1.0' }, { capabilities: { tools: {} } });
 
   /* ---------------- Browser ---------------- */
@@ -135,11 +220,13 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
             `(erlaubt: ${config.allowedDomains.join(', ')}).`,
         );
       }
-      const opened = await openSession(target);
-      if (url !== undefined) await opened.goto(url);
-      return text(
-        `Browser offen (Profil "${opened.profile}", ${opened.profileDir}).\nAktuelle URL: ${opened.page().url()}`,
-      );
+      return exclusive(async () => {
+        const opened = await openSession(target);
+        if (url !== undefined) await opened.goto(url);
+        return text(
+          `Browser offen (Profil "${opened.profile}", ${opened.profileDir}).\nAktuelle URL: ${opened.page().url()}`,
+        );
+      });
     },
   );
 
@@ -153,18 +240,24 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
         'Navigation ungueltig.',
       inputSchema: {},
     },
-    async () => {
-      const page = requireSession().page();
-      const withAi = page as PageWithSnapshotForAI;
-      if (typeof withAi._snapshotForAI !== 'function') {
-        throw new Error(
-          'Diese Playwright-Version liefert keinen Snapshot mit Referenzen ' +
-            '(page._snapshotForAI fehlt). Erwartet wird Playwright 1.56.',
-        );
-      }
-      const snapshot = await withAi._snapshotForAI();
-      return text(`URL: ${page.url()}\nTitel: ${await page.title()}\n\n${snapshot}`);
-    },
+    async () =>
+      exclusive(async () => {
+        const page = requireSession().page();
+        const withAi = page as PageWithSnapshotForAI;
+        if (typeof withAi._snapshotForAI !== 'function') {
+          throw new Error(
+            'Diese Playwright-Version liefert keinen Snapshot mit Referenzen ' +
+              '(page._snapshotForAI fehlt). Erwartet wird Playwright 1.56.',
+          );
+        }
+        const snapshot = await withAi._snapshotForAI();
+        // Der Snapshot enthaelt Feldwerte im Klartext, auch die von
+        // Passwortfeldern. Vor der Rueckgabe schwaerzen.
+        const secrets = await collectSecretValues(page);
+        const safe = redactSecrets(snapshot, secrets);
+        if (secrets.length > 0) log.info(`${secrets.length} Passwortwert(e) im Snapshot geschwaerzt.`);
+        return text(`URL: ${page.url()}\nTitel: ${await page.title()}\n\n${safe}`);
+      }),
   );
 
   server.registerTool(
@@ -174,13 +267,14 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
       description: 'Klickt das Element mit der angegebenen Referenz aus dem letzten browser_snapshot.',
       inputSchema: { ref: z.string().min(1).describe('Referenz aus browser_snapshot, z. B. e12 oder f1e3') },
     },
-    async ({ ref }) => {
-      const page = requireSession().page();
-      await withRefError(ref, async () => {
-        await resolveRef(page, ref).click();
-      });
-      return text(`Geklickt: ${ref}\nAktuelle URL: ${page.url()}`);
-    },
+    async ({ ref }) =>
+      exclusive(async () => {
+        const page = requireSession().page();
+        await withRefError(ref, async () => {
+          await resolveRef(page, ref).click();
+        });
+        return text(`Geklickt: ${ref}\nAktuelle URL: ${page.url()}`);
+      }),
   );
 
   server.registerTool(
@@ -193,13 +287,27 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
         text: z.string().describe('Der einzugebende Text'),
       },
     },
-    async ({ ref, text: value }) => {
-      const page = requireSession().page();
-      await withRefError(ref, async () => {
-        await resolveRef(page, ref).fill(value);
-      });
-      return text(`Eingegeben in ${ref} (${value.length} Zeichen).`);
-    },
+    async ({ ref, text: value }) =>
+      exclusive(async () => {
+        const page = requireSession().page();
+        let mode = 'fill';
+        await withRefError(ref, async () => {
+          const locator = resolveRef(page, ref);
+          try {
+            // fill() setzt den Wert in einem Rutsch - richtig fuer Formularfelder.
+            await locator.fill(value);
+          } catch (err) {
+            // Nicht jedes Ziel ist fuellbar (eigene Widgets, contenteditable-
+            // Konstrukte). Dann echt tippen: das feuert Taste fuer Taste und
+            // laesst Typeahead und Validierung der Seite laufen.
+            log.warn(`fill() auf ${ref} fehlgeschlagen (${(err as Error).message.split('\n')[0]}), tippe stattdessen.`);
+            await locator.click();
+            await locator.pressSequentially(value);
+            mode = 'pressSequentially';
+          }
+        });
+        return text(`Eingegeben in ${ref} (${value.length} Zeichen, ${mode}).`);
+      }),
   );
 
   server.registerTool(
@@ -209,16 +317,30 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
       description: 'Erstellt einen PNG-Screenshot der aktuellen Seite und liefert ihn als Bild zurueck.',
       inputSchema: { fullPage: z.boolean().default(false).describe('Ganze Seite statt nur des sichtbaren Bereichs') },
     },
-    async ({ fullPage }) => {
-      const page = requireSession().page();
-      const buffer = await page.screenshot({ fullPage, type: 'png' });
-      return {
-        content: [
-          { type: 'text' as const, text: `Screenshot von ${page.url()} (${buffer.length} Bytes).` },
-          { type: 'image' as const, data: buffer.toString('base64'), mimeType: 'image/png' },
-        ],
-      };
-    },
+    async ({ fullPage }) =>
+      exclusive(async () => {
+        const page = requireSession().page();
+        const buffer = await page.screenshot({ fullPage, type: 'png' });
+        if (buffer.length > MAX_SCREENSHOT_BYTES) {
+          // Ein ganzseitiger PNG einer echten Seite kann mehrere Megabyte gross
+          // sein; base64-codiert sprengt das jedes Kontextfenster. Dann lieber
+          // auf die Platte und nur den Pfad melden.
+          mkdirSync(config.screenshotsDirAbs, { recursive: true });
+          const file = join(config.screenshotsDirAbs, `screenshot-${new Date().toISOString().replace(/[:.]/g, '-')}.png`);
+          writeFileSync(file, buffer);
+          return text(
+            `Screenshot von ${page.url()} ist mit ${buffer.length} Bytes zu gross fuer eine Antwort ` +
+              `(Grenze ${MAX_SCREENSHOT_BYTES}). Datei: ${file}\n` +
+              `Tipp: ohne fullPage aufrufen, dann wird nur der sichtbare Bereich aufgenommen.`,
+          );
+        }
+        return {
+          content: [
+            { type: 'text' as const, text: `Screenshot von ${page.url()} (${buffer.length} Bytes).` },
+            { type: 'image' as const, data: buffer.toString('base64'), mimeType: 'image/png' },
+          ],
+        };
+      }),
   );
 
   /* ---------------- Recorder ---------------- */
@@ -309,7 +431,8 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
           .describe('Name des Flows ohne Endung'),
       },
     },
-    async ({ name }) => {
+    async ({ name }) =>
+      exclusive(async () => {
       const active = session ?? (await openSession(defaultProfile));
       const result = await replayFlow(active, config, name);
       const lines = result.steps.map((step) => `  #${step.index} ${step.kind}: ${step.status} - ${step.detail}`);
@@ -321,7 +444,7 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
             : '') +
           lines.join('\n'),
       );
-    },
+      }),
   );
 
   /* ---------------- Logs ---------------- */
@@ -330,7 +453,10 @@ export function createMcpServer(options: McpOptions = {}): WebpilotMcp {
     'log_tail',
     {
       title: 'Log-Ende',
-      description: 'Liefert die letzten n Zeilen des webpilot-Logs (dasselbe, was auf stderr laeuft).',
+      description:
+        'Liefert die letzten n Zeilen des webpilot-Logs (dasselbe, was auf stderr laeuft). ' +
+        'Der Puffer gehoert diesem Serverprozess: Zeilen aus einem separaten `webpilot record`-Lauf ' +
+        'sind hier nicht sichtbar.',
       inputSchema: { n: z.number().int().min(1).max(1000).default(50).describe('Anzahl Zeilen, 1 bis 1000') },
     },
     async ({ n }) => {

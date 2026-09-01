@@ -110,6 +110,12 @@ export function wprState(): Record<string, unknown> {
       enterPending: null as unknown,
       /** Shadow-Roots, die bereits change/submit-Listener tragen. */
       shadowRoots: new WeakSet<object>(),
+      /**
+       * Elemente, die jemals ein Passwortfeld waren. Ein "Passwort anzeigen"-
+       * Schalter setzt type=password auf type=text um - ohne dieses Gedaechtnis
+       * stuende der Klartext beim naechsten Herausschreiben im Log.
+       */
+      secrets: new WeakSet<object>(),
       installed: false,
     };
     w['__webpilotState'] = st;
@@ -136,7 +142,13 @@ export function wprFlush(): void {
   while (queue.length > 0) {
     const item = queue.shift();
     try {
-      (sink as (v: unknown) => void)(item);
+      // Das Binding liefert ein Promise, das beim Seitenwechsel abgelehnt wird.
+      // Ohne catch entstuende in der aufgezeichneten Seite ein
+      // unhandledrejection - ausgerechnet dort, wo wir nichts kaputtmachen wollen.
+      const result = (sink as (v: unknown) => unknown)(item);
+      if (result && typeof (result as { catch?: unknown }).catch === 'function') {
+        (result as { catch: (fn: () => void) => void }).catch(() => {});
+      }
     } catch {
       // Kontext im Umbau (Navigation): das Ereignis ist verloren, nicht kritisch.
     }
@@ -186,7 +198,15 @@ export function wprNotePending(el: unknown): void {
     | undefined;
   if (!describe) return;
   const info = describe(el);
-  const isSecret = info['isPassword'] === true;
+  const knownSecrets = st['secrets'] as WeakSet<object>;
+  // Einmal Passwortfeld, immer Passwortfeld: ein "Passwort anzeigen"-Schalter
+  // macht aus type=password ein type=text, der Inhalt bleibt aber geheim.
+  const isSecret = info['isPassword'] === true || knownSecrets.has(el as object);
+  if (isSecret) {
+    knownSecrets.add(el as object);
+    info['isPassword'] = true;
+    info['text'] = '';
+  }
   const value = isSecret ? '{{secret:' + String(info['fieldName']) + '}}' : wprValueOf(el);
   // Schon gemeldeter Wert: nichts vormerken. Sonst erzeugt das change-Event,
   // das beim Absenden nachtraeglich feuert, eine zweite identische Zeile.
@@ -531,39 +551,61 @@ export async function attachRecorder(
   let count = 0;
   const lastNavigation = new WeakMap<Page, string>();
 
+  /**
+   * Ereignisse kommen aus zwei Quellen (Binding und framenavigated) und die
+   * Binding-Verarbeitung ist asynchron (die Frame-Kette muss aus der Seite
+   * geholt werden). Ohne Serialisierung koennte ein spaeteres Ereignis, dessen
+   * Frame-Aufloesung schneller fertig ist, VOR einem frueheren in der Datei
+   * landen. Deshalb: index synchron vergeben, Schreiben ueber eine Kette.
+   */
+  let queue: Promise<void> = Promise.resolve();
+  const enqueue = (task: () => Promise<void>): Promise<void> => {
+    queue = queue.then(task, () => undefined).catch(() => undefined);
+    return queue;
+  };
+
   const write = (event: FlowEvent): void => {
     if (!sink) return;
     sink(event);
   };
 
+  const nextIndex = (): number => index++;
+
   // GENAU EINMAL: sonst wirft der zweite record_start.
-  await context.exposeBinding(BINDING_NAME, async (source, payload: unknown) => {
-    if (!sink) return;
+  await context.exposeBinding(BINDING_NAME, (source, payload: unknown) => {
+    if (!sink) return undefined;
+    // Synchron, noch vor jedem await: die Reihenfolge steht damit fest.
+    const eventIndex = nextIndex();
     const raw = payload as Record<string, unknown>;
-    let frame: FrameRef = { path: [], url: '', name: '' };
-    try {
-      frame = await describeFrame(source.frame);
-    } catch (err) {
-      log.warn(`Frame-Beschreibung fehlgeschlagen: ${(err as Error).message}`);
-    }
-    const candidate = {
-      ...raw,
-      index: index++,
-      ts: new Date().toISOString(),
-      url: String(raw['pageUrl'] ?? source.frame.url()),
-      frame,
-    };
-    delete (candidate as Record<string, unknown>)['pageUrl'];
-    delete (candidate as Record<string, unknown>)['pageTs'];
-    delete (candidate as Record<string, unknown>)['seq'];
-    const parsed = FlowEventSchema.safeParse(candidate);
-    if (!parsed.success) {
-      log.warn(`Ereignis verworfen: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
-      index--;
-      return;
-    }
-    count++;
-    write(parsed.data);
+    return enqueue(async () => {
+      if (!sink) return;
+      let frame: FrameRef = { path: [], url: '', name: '' };
+      try {
+        frame = await describeFrame(source.frame);
+      } catch (err) {
+        log.warn(`Frame-Beschreibung fehlgeschlagen: ${(err as Error).message}`);
+      }
+      const candidate: Record<string, unknown> = {
+        ...raw,
+        index: eventIndex,
+        ts: new Date().toISOString(),
+        url: String(raw['pageUrl'] ?? source.frame.url()),
+        frame,
+      };
+      delete candidate['pageUrl'];
+      delete candidate['pageTs'];
+      delete candidate['seq'];
+      const parsed = FlowEventSchema.safeParse(candidate);
+      if (!parsed.success) {
+        log.warn(
+          `Ereignis #${eventIndex} verworfen: ` +
+            parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; '),
+        );
+        return;
+      }
+      count++;
+      write(parsed.data);
+    });
   });
 
   await context.addInitScript({ content: buildInPageSource() });
@@ -590,20 +632,21 @@ export async function attachRecorder(
       if (!isAllowedUrl(url, config.allowedDomains)) return;
       if (lastNavigation.get(page) === url) return;
       lastNavigation.set(page, url);
+      const eventIndex = nextIndex();
       const event = FlowEventSchema.safeParse({
         kind: 'navigate',
-        index: index++,
-        id: `nav:${index}`,
+        index: eventIndex,
+        id: `nav:${eventIndex}`,
         ts: new Date().toISOString(),
         url,
         frame: { path: [], url, name: frame.name() },
       });
-      if (!event.success) {
-        index--;
-        return;
-      }
-      count++;
-      write(event.data);
+      if (!event.success) return;
+      void enqueue(async () => {
+        if (!sink) return;
+        count++;
+        write(event.data);
+      });
     });
   };
 
@@ -634,11 +677,11 @@ export async function attachRecorder(
       // notieren; die folgende Navigation liefert den Startpunkt dann selbst.
       const page = context.pages().at(-1);
       const startUrl = page?.mainFrame().url() ?? '';
-      if (page && startUrl && startUrl !== 'about:blank') {
+      if (page && startUrl && startUrl !== 'about:blank' && isAllowedUrl(startUrl, config.allowedDomains)) {
         lastNavigation.set(page, startUrl);
         const start = FlowEventSchema.safeParse({
           kind: 'navigate',
-          index: index++,
+          index: nextIndex(),
           id: 'nav:start',
           ts: new Date().toISOString(),
           url: startUrl,
@@ -647,8 +690,6 @@ export async function attachRecorder(
         if (start.success) {
           count++;
           write(start.data);
-        } else {
-          index--;
         }
       }
 
@@ -659,6 +700,8 @@ export async function attachRecorder(
       const finishedName = name;
       const target = flowPath(config, finishedName);
       const out = stream;
+      // Erst alles Angestaute wegschreiben, dann die Senke schliessen.
+      await queue;
       sink = null;
       stream = null;
       name = null;

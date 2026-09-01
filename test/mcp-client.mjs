@@ -149,6 +149,21 @@ try {
   check('nach flow_run steht der eingeloggte Zustand auf dem Schirm',
     !verify.isError && textOf(verify).includes('Willkommen, demo'), textOf(verify).split('\n')[0]);
 
+  /* ---------- Passwoerter duerfen nicht im Snapshot stehen ---------- */
+  await client.callTool({ name: 'browser_open', arguments: { url: `${origin}/` } });
+  const s1 = await client.callTool({ name: 'browser_snapshot', arguments: {} });
+  const r1 = (textOf(s1).match(/textbox "Benutzername"[^\n]*\[ref=(\S+?)\]/) ?? [])[1];
+  const r2 = (textOf(s1).match(/textbox "Passwort"[^\n]*\[ref=(\S+?)\]/) ?? [])[1];
+  await client.callTool({ name: 'browser_type', arguments: { ref: r1, text: 'demo' } });
+  await client.callTool({ name: 'browser_type', arguments: { ref: r2, text: 'streng-geheim-42' } });
+  const s2 = await client.callTool({ name: 'browser_snapshot', arguments: {} });
+  const filled = textOf(s2);
+  check('Snapshot zeigt den Wert eines normalen Feldes', filled.includes('demo'));
+  check('Snapshot zeigt das Passwort NICHT im Klartext', !filled.includes('streng-geheim-42'),
+    filled.split('\n').filter((l) => l.includes('Passwort')).join(' | '));
+  check('Snapshot schwaerzt das Passwort mit {{secret:...}}', filled.includes('{{secret:password}}'),
+    filled.split('\n').filter((l) => l.includes('secret')).join(' | '));
+
   const tail = await client.callTool({ name: 'log_tail', arguments: { n: 5 } });
   const tailText = textOf(tail);
   check('log_tail liefert die letzten Logzeilen', !tail.isError && /\d{4}-\d\d-\d\dT.*\[(replay|mcp|browser|recorder)\]/.test(tailText),

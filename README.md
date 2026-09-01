@@ -54,7 +54,10 @@ Versionswechsel ist Pflicht.
 | `*.example.com`   | nur Subdomains, nicht die Apex-Domain               |
 | `*`               | alles (bewusst explizit)                            |
 
-Nicht-HTTP(S)-Schemata (`file:`, `data:`, `javascript:`) sind nie erlaubt.
+Verglichen wird ausschliesslich der Hostname: **der Port spielt keine Rolle**
+(`localhost` deckt jeden Port ab) und `http` und `https` sind gleichermassen
+erlaubt. Nicht-HTTP(S)-Schemata (`file:`, `data:`, `javascript:`) sind nie
+erlaubt.
 
 **Die Allowlist greift nur auf Navigationen des Hauptframes.** Subframes bleiben
 frei — sonst brechen Logins mit eingebettetem OAuth oder Captcha.
@@ -219,6 +222,27 @@ Alle Eingaben sind mit zod validiert. Fehler kommen als **Tool-Error**
 Referenzen aus `browser_snapshot` gelten nur fuer den zuletzt erstellten
 Snapshot und werden durch Navigation ungueltig; das Tool sagt das dann auch so.
 
+Ein paar Eigenschaften, die man kennen sollte:
+
+- **`browser_snapshot` schwaerzt Passwoerter.** Der ARIA-Snapshot enthaelt
+  Feldwerte im Klartext, auch die von Passwortfeldern. Auf einer Seite mit
+  gespeichertem oder automatisch gefuelltem Login waere jeder Snapshot sonst
+  ein Passwort-Leak ins Transkript. webpilot ersetzt solche Werte vor der
+  Rueckgabe durch `{{secret:<feld>}}`.
+- **Aufrufe werden serialisiert.** Das SDK laesst Tool-Aufrufe parallel laufen;
+  auf einer geteilten Seite entwertet ein navigierender `browser_click` genau
+  die Referenzen, die ein gleichzeitiger `browser_snapshot` gerade ausgibt.
+  Alles, was den Browser anfasst, laeuft deshalb nacheinander.
+- **`browser_type` benutzt `fill()`** — ein Rutsch, richtig fuer Formularfelder.
+  Nur wenn das Ziel nicht fuellbar ist, wird echt getippt (`pressSequentially`),
+  damit Typeahead und Validierung der Seite laufen.
+- **`browser_screenshot`** liefert PNG. Ab 2 MB wird das Bild nicht eingebettet,
+  sondern nach `screenshots/` geschrieben und nur der Pfad gemeldet — ein
+  ganzseitiger Screenshot einer echten Seite sprengt sonst jedes Kontextfenster.
+- **`log_tail` sieht nur diesen Prozess.** Der Ringpuffer gehoert dem laufenden
+  MCP-Server; Zeilen aus einem separaten `webpilot record`-Lauf stehen nicht
+  darin.
+
 ### Einbinden in Claude Code
 
 `.mcp.json` im Projektverzeichnis (projektweit geteilt):
@@ -249,6 +273,17 @@ muss absolut sein.
 
 Auf einem Rechner ohne Bildschirm zusaetzlich `"WEBPILOT_HEADLESS": "1"` in
 `env` setzen — oder `command: "xvfb-run"` mit `args: ["-a", "node", ...]`.
+
+Als `command` gehoert hier `node` hin, nicht `npm`: `npm run mcp` schreibt
+seinen eigenen Banner auf **stdout**, und dort laeuft das JSON-RPC-Protokoll.
+Der SDK-Client verkraftet die zwei Zeilen zwar (nicht parsebare Zeilen werden
+gemeldet und uebersprungen), aber sauber ist es nicht. Fuer den manuellen Test
+ist `npm run mcp` in Ordnung — der Build-Schritt darin schreibt bereits nach
+stderr, damit wenigstens `tsc` das Protokoll nicht stoert.
+
+Der Standard-Timeout des SDK-Clients liegt bei 60 s. Der allererste Aufruf von
+`browser_open` startet einen Chromium und kann bei kaltem Cache laenger
+brauchen.
 
 ---
 
