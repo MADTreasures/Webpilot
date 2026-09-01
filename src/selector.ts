@@ -234,13 +234,23 @@ export function wpAccName(el: unknown): string {
 }
 
 /** Ein Pfadsegment: Tagname plus :nth-of-type, falls noetig. */
-export function wpCssSegment(el: unknown): string {
+export function wpCssSegment(el: unknown, useNthChild: boolean): string {
   const e = el as { localName: string; parentElement: unknown; parentNode: unknown };
   const tag = e.localName;
   // Beim obersten Kind einer Shadow-Root ist parentElement null, die
   // Geschwister stehen aber unter parentNode (der Shadow-Root selbst).
   const parent = (e.parentElement ?? e.parentNode) as { children?: ArrayLike<{ localName: string }> } | null;
   if (!parent || !parent.children) return tag;
+  if (useNthChild) {
+    // Positionsvariante: haengt IMMER ein :nth-child an. Dadurch ist dieser
+    // Pfad garantiert ein anderer String als die nth-of-type-Variante und
+    // bricht bei anderen DOM-Aenderungen - genau das macht ihn als Fallback
+    // brauchbar.
+    for (let i = 0; i < parent.children.length; i++) {
+      if (parent.children[i] === (el as unknown)) return tag + ':nth-child(' + (i + 1) + ')';
+    }
+    return tag;
+  }
   let index = 0;
   let total = 0;
   for (let i = 0; i < parent.children.length; i++) {
@@ -261,7 +271,7 @@ export function wpCssSegment(el: unknown): string {
  * Shadow-Grenzen werden mit einem Descendant-Kombinator ueberbrueckt, weil
  * Playwrights css-Engine offene Shadow-Roots durchdringt.
  */
-export function wpCssPath(el: unknown, anchorAtAncestorId: boolean): string {
+export function wpCssPath(el: unknown, anchorAtAncestorId: boolean, useNthChild: boolean): string {
   type Step = { sel: string; sep: string };
   const chain: Step[] = [];
   let node = el as { nodeType: number; id?: string; parentElement: unknown; getRootNode?: () => { host?: unknown } } | null;
@@ -274,7 +284,7 @@ export function wpCssPath(el: unknown, anchorAtAncestorId: boolean): string {
       chain.push({ sel: '#' + wpCssEscape(String(node.id)), sep: sep });
       break;
     }
-    chain.push({ sel: wpCssSegment(node), sep: sep });
+    chain.push({ sel: wpCssSegment(node, useNthChild), sep: sep });
     const parent = node.parentElement as typeof node;
     if (parent) {
       sep = ' > ';
@@ -311,14 +321,20 @@ export function wpAttrCss(el: unknown): string | null {
   };
   const tag = e.localName;
   const bits: string[] = [tag];
-  const name = e.getAttribute('name');
   const type = e.getAttribute('type');
-  const placeholder = e.getAttribute('placeholder');
-  const ariaLabel = e.getAttribute('aria-label');
-  if (name) bits.push('[name=' + wpQuoteAttr(name) + ']');
-  else if (ariaLabel) bits.push('[aria-label=' + wpQuoteAttr(ariaLabel) + ']');
-  else if (placeholder) bits.push('[placeholder=' + wpQuoteAttr(placeholder) + ']');
-  else return null;
+  // Ein stabiles, aussagekraeftiges Attribut - in dieser Reihenfolge.
+  const attrOrder = ['name', 'aria-label', 'placeholder', 'href', 'action', 'alt', 'title'];
+  let chosen: string | null = null;
+  for (let i = 0; i < attrOrder.length; i++) {
+    const attr = attrOrder[i];
+    if (!attr) continue;
+    const value = e.getAttribute(attr);
+    if (value === null || value === '' || value.length > 200) continue;
+    chosen = attr;
+    bits.push('[' + attr + '=' + wpQuoteAttr(value) + ']');
+    break;
+  }
+  if (chosen === null) return null;
   if (type && tag === 'input') bits.push('[type=' + wpQuoteAttr(type) + ']');
   const self = bits.join('');
 
@@ -401,10 +417,18 @@ export function wpVerifyRole(el: unknown, role: string, name: string): number {
   return count === 1 && hit ? 1 : 0;
 }
 
+/** Hat das Element eigene Textknoten und keine Element-Kinder? */
+export function wpIsTextLeaf(el: unknown): boolean {
+  const e = el as { children?: { length: number } };
+  return !!e && !!e.children && e.children.length === 0;
+}
+
 /**
- * Verifiziert einen Textselektor. Ohne Sichtbarkeitsfilter, weil der beim
- * Replay eingesetzte locator(tag).filter({hasText}) ebenfalls keinen hat -
- * die Zaehlung soll das abbilden, was spaeter wirklich passiert.
+ * Verifiziert einen Textselektor.
+ *
+ * Gezaehlt wird genau das, was beim Replay als `<tag>:text-is("...")` gesucht
+ * wird: gleicher Tagname, keine Element-Kinder, gleicher normalisierter Text.
+ * Ohne Sichtbarkeitsfilter, weil die Selektor-Engine auch keinen hat.
  */
 export function wpVerifyText(el: unknown, text: string, tag: string | null): number {
   if (wpInShadow(el)) return -1;
@@ -415,6 +439,7 @@ export function wpVerifyText(el: unknown, text: string, tag: string | null): num
   for (let i = 0; i < list.length; i++) {
     const candidate = list[i] as { localName: string; textContent: string | null };
     if (tag && candidate.localName !== tag) continue;
+    if (!wpIsTextLeaf(candidate)) continue;
     if (wpNorm(candidate.textContent, 400) !== text) continue;
     count++;
     if (candidate === el) hit = true;
@@ -479,9 +504,18 @@ export function wpCandidates(el: unknown): Array<{ spec: unknown; verify: number
     push({ kind: 'role', role: role, name: accName, exact: true }, wpVerifyRole(el, role, accName), 'role');
   }
 
-  // 4. Sichtbarer Text - nur fuer Elemente, die ihren Namen aus dem Text ziehen
+  // 4. Sichtbarer Text - nur fuer Blattelemente. `<li><span>Alpha</span></li>`
+  // hat zwar textContent "Alpha", aber :text-is greift dort auf den span, nicht
+  // auf das li: ein Textselektor fuer das li wuerde die Aktion still eine Ebene
+  // tiefer umlenken. Fuer input/textarea ergibt Text ohnehin keinen Sinn.
   const ownText = wpNorm(e.textContent, 120);
-  if (ownText && ownText.length <= 80 && e.localName !== 'input' && e.localName !== 'textarea') {
+  if (
+    ownText &&
+    ownText.length <= 80 &&
+    wpIsTextLeaf(el) &&
+    e.localName !== 'input' &&
+    e.localName !== 'textarea'
+  ) {
     push({ kind: 'text', value: ownText, tag: e.localName }, wpVerifyText(el, ownText, e.localName), 'text');
   }
 
@@ -489,11 +523,18 @@ export function wpCandidates(el: unknown): Array<{ spec: unknown; verify: number
   const attrCss = wpAttrCss(el);
   if (attrCss) push({ kind: 'css', value: attrCss }, wpVerifyCss(el, attrCss), 'css-attr');
 
-  const anchored = wpCssPath(el, true);
+  const anchored = wpCssPath(el, true, false);
   if (anchored) push({ kind: 'css', value: anchored }, wpVerifyCss(el, anchored), 'css-anchored');
 
-  const full = wpCssPath(el, false);
+  const full = wpCssPath(el, false, false);
   if (full && full !== anchored) push({ kind: 'css', value: full }, wpVerifyCss(el, full), 'css-full');
+
+  // Positionspfad. Immer ein anderer String als die beiden oberen (dort steht
+  // nie ein :nth-child) und damit der garantierte letzte Fallback.
+  const positional = wpCssPath(el, false, true);
+  if (positional && positional !== anchored && positional !== full) {
+    push({ kind: 'css', value: positional }, wpVerifyCss(el, positional), 'css-position');
+  }
 
   return out;
 }
@@ -546,7 +587,7 @@ export function wpDescribe(el: unknown): unknown {
   const isPassword = wpIsPassword(el);
   return {
     selectors: {
-      primary: primary ? primary.spec : { kind: 'css', value: wpCssPath(el, false) || e.localName },
+      primary: primary ? primary.spec : { kind: 'css', value: wpCssPath(el, false, false) || e.localName },
       fallbacks: fallbacks,
       unique: primary ? primary.verify === 1 : false,
     },
@@ -580,6 +621,7 @@ export const SELECTOR_INPAGE_FUNCTIONS = [
   wpVerifyCss,
   wpAllElements,
   wpVerifyRole,
+  wpIsTextLeaf,
   wpVerifyText,
   wpFieldName,
   wpIsPassword,
@@ -606,17 +648,21 @@ export function toLocator(scope: LocatorScope, spec: SelectorSpec): Locator {
         exact: spec.exact,
       });
     case 'text':
+      // :text-is vergleicht exakt und mit normalisiertem Whitespace - genau so,
+      // wie der Text bei der Aufnahme normalisiert wurde. filter({hasText}) mit
+      // einem RegExp waere falsch: das prueft gegen den ROHEN textContent, ein
+      // ueber zwei Zeilen umbrochener Button faende sich damit nie wieder.
       return spec.tag
-        ? scope.locator(spec.tag).filter({ hasText: exactText(spec.value) })
+        ? scope.locator(`${spec.tag}:text-is(${quoteText(spec.value)})`)
         : scope.getByText(spec.value, { exact: true });
     case 'css':
       return scope.locator(spec.value);
   }
 }
 
-function exactText(value: string): RegExp {
-  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`^\\s*${escaped}\\s*$`);
+/** Text fuer :text-is("...") in doppelte Anfuehrungszeichen setzen. */
+function quoteText(value: string): string {
+  return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
 }
 
 function quoteAttr(value: string): string {
@@ -633,7 +679,7 @@ export function describeSelector(spec: SelectorSpec): string {
     case 'role':
       return `role=${spec.role}[name=${JSON.stringify(spec.name)}${spec.exact ? ' exact' : ''}]`;
     case 'text':
-      return `text=${JSON.stringify(spec.value)}${spec.tag ? ` (<${spec.tag}>)` : ''}`;
+      return spec.tag ? `${spec.tag}:text-is(${JSON.stringify(spec.value)})` : `text=${JSON.stringify(spec.value)}`;
     case 'css':
       return `css=${spec.value}`;
   }

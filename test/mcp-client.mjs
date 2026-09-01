@@ -103,7 +103,7 @@ try {
   const refFor = (re) => (snapText.match(re) ?? [])[1];
   const userRef = refFor(/textbox "Benutzername"[^\n]*\[ref=(\S+?)\]/);
   const passRef = refFor(/textbox "Passwort"[^\n]*\[ref=(\S+?)\]/);
-  const btnRef = refFor(/button "Anmelden"[^\n]*\[ref=(\S+?)\]/);
+  const btnRef = refFor(/button "Anmelden[^"]*"[^\n]*\[ref=(\S+?)\]/);
   check('Snapshot benennt die Formularelemente', !!userRef && !!passRef && !!btnRef, `${userRef}/${passRef}/${btnRef}`);
 
   const badRef = await client.callTool({ name: 'browser_click', arguments: { ref: 'nicht-echt' } });

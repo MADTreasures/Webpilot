@@ -410,6 +410,16 @@ etwas — man merkt es erst am leeren JSONL. webpilot haengt deshalb an jede Sei
 einen `pageerror`-Listener und protokolliert Fehler, die nach Recorder-Code
 aussehen, als `ERROR`.
 
+**Textselektoren als `<tag>:text-is("...")`.** Der naheliegende Weg,
+`locator(tag).filter({ hasText: /^\s*Text\s*$/ })`, prueft gegen den ROHEN
+`textContent`. Ein Button, dessen Beschriftung im Markup ueber zwei Zeilen
+umbrochen ist, waere damit nie wieder zu finden — aufgezeichnet wird der Text
+ja mit normalisiertem Whitespace. `:text-is()` normalisiert genauso und
+vergleicht exakt. Weil `:text-is` nur auf Blattelemente greift, wird ein
+Textselektor auch nur fuer solche erzeugt: bei `<li><span>Alpha</span></li>`
+wuerde ein Textselektor fuer das `li` die Aktion sonst still eine Ebene tiefer
+umlenken.
+
 **Selektor-Kandidaten werden in der Seite verifiziert.** Jeder Kandidat wird vor
 dem Aufschreiben gezaehlt (CSS ueber `querySelectorAll`, Rolle und Text ueber
 einen Durchlauf durch die Wurzel mit derselben Rollen- und Namensberechnung).

@@ -113,7 +113,7 @@ try {
     await p.locator('#password').click();
     await p.keyboard.type('s3cr3t', { delay: 10 });
     await p.locator('#remember').click();
-    await p.getByRole('button', { name: 'Anmelden' }).click();
+    await p.getByTestId('login-submit').click();
     await p.waitForURL('**/welcome*', { timeout: 15000 });
     await p.waitForTimeout(400);
     const res = await s.recorder.stop();
@@ -140,6 +140,13 @@ try {
     const submit = lines.find((e) => e.kind === 'submit');
     check('submit ist ueber SubmitEvent.submitter kausal zugeordnet',
       submit?.causeKind === 'submitter' && lines.some((e) => e.id === submit.causedBy && e.kind === 'click'));
+    // Der Buttontext im Markup ist umbrochen. Aufgezeichnet wird er mit
+    // normalisiertem Whitespace - der Textselektor muss trotzdem greifen.
+    const btn = lines.find((e) => e.kind === 'click' && e.target?.tag === 'button');
+    const textSel = [btn?.target.selectors.primary, ...(btn?.target.selectors.fallbacks ?? [])]
+      .find((sel) => sel?.kind === 'text');
+    check('mehrzeiliger Buttontext wird normalisiert aufgezeichnet',
+      textSel?.value === 'Anmelden und weiter', JSON.stringify(textSel));
   }
 
   section('Recorder: Enter im iframe mit wechselnder Nonce');
@@ -260,6 +267,26 @@ try {
     const who = await s.page().locator('[data-testid="who"]').textContent().catch(() => null);
     await s.close();
     check('kaputte Primaerselektoren werden von den Fallbacks aufgefangen', who === 'demo', String(who));
+  }
+
+  {
+    // Nur der Textselektor bleibt uebrig: greift er trotz umbrochenem Markup?
+    const lines = clickFlow.trim().split('\n').map((l) => JSON.parse(l));
+    let usedText = false;
+    for (const e of lines) {
+      if (e.kind !== 'click' || e.target?.tag !== 'button') continue;
+      const all = [e.target.selectors.primary, ...e.target.selectors.fallbacks];
+      const textSel = all.find((sel) => sel.kind === 'text');
+      if (!textSel) continue;
+      e.target.selectors = { primary: textSel, fallbacks: [], unique: true };
+      usedText = true;
+    }
+    writeFileSync(`${config.flowsDirAbs}/login-text.jsonl`, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+    const s = await open('textsel');
+    await replayFlow(s, config, 'login-text', { env: { WEBPILOT_SECRET_PASSWORD: 's3cr3t' } });
+    const who = await s.page().locator('[data-testid="who"]').textContent().catch(() => null);
+    await s.close();
+    check('Textselektor auf mehrzeiligem Buttontext trifft beim Replay', usedText && who === 'demo', String(who));
   }
 
   {
